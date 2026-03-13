@@ -581,7 +581,7 @@ run_sub_dir_uid_gid_case(){
 
     run_as_user_cmd "$TEST_USER_1" "dd if=/dev/zero of=/jfs/uid_cap bs=1G count=1"
     sleep $DIR_QUOTA_FLUSH_INTERVAL
-    run_as_user_cmd "$TEST_USER_1" "echo a >> /jfs/uid_cap" 2>error.log \
+    run_as_user_cmd "$TEST_USER_1" "echo a | tee -a /jfs/uid_cap" 2>error.log \
         && echo "uid capacity quota should block write via subdir mount" && exit 1 || true
     grep -i "Disk quota exceeded" error.log || (echo "uid subdir capacity quota not enforced" && exit 1)
 
@@ -596,7 +596,7 @@ run_sub_dir_uid_gid_case(){
 
     run_as_user_cmd "$TEST_USER_2" "dd if=/dev/zero of=/jfs/gid_cap bs=1G count=1"
     sleep $DIR_QUOTA_FLUSH_INTERVAL
-    run_as_user_cmd "$TEST_USER_2" "echo a >> /jfs/gid_cap" 2>error.log \
+    run_as_user_cmd "$TEST_USER_2" "echo a | tee -a /jfs/gid_cap" 2>error.log \
         && echo "gid capacity quota should block write via subdir mount" && exit 1 || true
     grep -i "Disk quota exceeded" error.log || (echo "gid subdir capacity quota not enforced" && exit 1)
 
@@ -632,7 +632,7 @@ run_hard_link_uid_gid_case(){
     run_as_user_cmd "$TEST_USER_1" "dd if=/dev/zero of=/jfs/ughl/uid_test2 bs=1G count=1"
     sleep $DIR_QUOTA_FLUSH_INTERVAL
 
-    run_as_user_cmd "$TEST_USER_1" "echo a >> /jfs/ughl/uid_test2" 2>error.log \
+    run_as_user_cmd "$TEST_USER_1" "echo a | tee -a /jfs/ughl/uid_test2" 2>error.log \
         && echo "uid capacity quota should block write after 2G used" && exit 1 || true
     grep -i "Disk quota exceeded" error.log || (echo "uid hardlink capacity quota not enforced" && exit 1)
 
@@ -732,7 +732,7 @@ run_remove_and_restore_uid_gid_case(){
 
     run_as_user_cmd "$TEST_USER_1" "dd if=/dev/zero of=/jfs/rrq/uid_file bs=1G count=1"
     sleep $DIR_QUOTA_FLUSH_INTERVAL
-    run_as_user_cmd "$TEST_USER_1" "echo a >> /jfs/rrq/uid_file" 2>error.log && echo "uid remove/restore should hit capacity quota" && exit 1 || true
+    run_as_user_cmd "$TEST_USER_1" "echo a | tee -a /jfs/rrq/uid_file" 2>error.log && echo "uid remove/restore should hit capacity quota" && exit 1 || true
     grep -i "Disk quota exceeded" error.log || (echo "uid remove/restore pre-delete quota check failed" && exit 1)
 
     rm -f /jfs/rrq/uid_file
@@ -740,12 +740,12 @@ run_remove_and_restore_uid_gid_case(){
     trash_dir=$(ls /jfs/.trash | tail -n1)
     ./juicefs restore $META_URL $trash_dir --put-back
     sleep $((HEARTBEAT_INTERVAL+HEARTBEAT_SLEEP))
-    run_as_user_cmd "$TEST_USER_1" "echo a >> /jfs/rrq/uid_file" 2>error.log && echo "uid restore should recover used space and keep quota enforcement" && exit 1 || true
+    run_as_user_cmd "$TEST_USER_1" "echo a | tee -a /jfs/rrq/uid_file" 2>error.log && echo "uid restore should recover used space and keep quota enforcement" && exit 1 || true
     grep -i "Disk quota exceeded" error.log || (echo "uid remove/restore post-restore quota check failed" && exit 1)
 
     run_as_user_cmd "$TEST_USER_2" "dd if=/dev/zero of=/jfs/rrq/gid_file bs=1G count=1"
     sleep $DIR_QUOTA_FLUSH_INTERVAL
-    run_as_user_cmd "$TEST_USER_2" "echo a >> /jfs/rrq/gid_file" 2>error.log && echo "gid remove/restore should hit capacity quota" && exit 1 || true
+    run_as_user_cmd "$TEST_USER_2" "echo a | tee -a /jfs/rrq/gid_file" 2>error.log && echo "gid remove/restore should hit capacity quota" && exit 1 || true
     grep -i "Disk quota exceeded" error.log || (echo "gid remove/restore pre-delete quota check failed" && exit 1)
 
     rm -f /jfs/rrq/gid_file
@@ -753,7 +753,7 @@ run_remove_and_restore_uid_gid_case(){
     trash_dir=$(ls /jfs/.trash | tail -n1)
     ./juicefs restore $META_URL $trash_dir --put-back
     sleep $((HEARTBEAT_INTERVAL+HEARTBEAT_SLEEP))
-    run_as_user_cmd "$TEST_USER_2" "echo a >> /jfs/rrq/gid_file" 2>error.log && echo "gid restore should recover used space and keep quota enforcement" && exit 1 || true
+    run_as_user_cmd "$TEST_USER_2" "echo a | tee -a /jfs/rrq/gid_file" 2>error.log && echo "gid restore should recover used space and keep quota enforcement" && exit 1 || true
     grep -i "Disk quota exceeded" error.log || (echo "gid remove/restore post-restore quota check failed" && exit 1)
 }
 
@@ -770,12 +770,12 @@ run_dir_capacity_uid_gid_case(){
 
     run_as_user_cmd "$TEST_USER_1" "dd if=/dev/zero of=/jfs/capq/uid_cap_file bs=1G count=1"
     sleep $DIR_QUOTA_FLUSH_INTERVAL
-    run_as_user_cmd "$TEST_USER_1" "echo a >> /jfs/capq/uid_cap_file" 2>error.log && echo "uid capacity quota should block append" && exit 1 || true
+    run_as_user_cmd "$TEST_USER_1" "echo a | tee -a /jfs/capq/uid_cap_file" 2>error.log && echo "uid capacity quota should block append" && exit 1 || true
     grep -i "Disk quota exceeded" error.log || (echo "uid capacity quota check failed" && exit 1)
 
     run_as_user_cmd "$TEST_USER_2" "dd if=/dev/zero of=/jfs/capq/gid_cap_file bs=1G count=1"
     sleep $DIR_QUOTA_FLUSH_INTERVAL
-    run_as_user_cmd "$TEST_USER_2" "echo a >> /jfs/capq/gid_cap_file" 2>error.log && echo "gid capacity quota should block append" && exit 1 || true
+    run_as_user_cmd "$TEST_USER_2" "echo a | tee -a /jfs/capq/gid_cap_file" 2>error.log && echo "gid capacity quota should block append" && exit 1 || true
     grep -i "Disk quota exceeded" error.log || (echo "gid capacity quota check failed" && exit 1)
 
     ./juicefs quota check $META_URL --uid "$TEST_UID_1" --strict
