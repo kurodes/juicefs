@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -569,32 +570,35 @@ func (m *baseMeta) doFlushQuotas() {
 
 }
 
-func (m *baseMeta) HandleQuota(ctx Context, cmd uint8, dpath string, uid uint32, gid uint32, quotas map[string]*Quota, strict, repair bool, create bool) error {
+func (m *baseMeta) HandleQuota(ctx Context, cmd uint8, qkey string, qtype uint32, quotas map[string]*Quota, strict, repair bool, create bool) error {
 	var inode Ino
-	if cmd != QuotaList && uid == 0 && gid == 0 && dpath != "" {
+	var dpath string
+	var key uint64
+
+	// For directory quota, resolve the path to get inode
+	if qtype == DirQuotaType && cmd != QuotaList {
+		dpath = qkey
 		if st := m.resolve(ctx, dpath, &inode, create); st != 0 {
 			return fmt.Errorf("resolve dir %s: %s", dpath, st)
 		}
 		if inode.IsTrash() {
 			return errors.New("no quota for any trash directory")
 		}
-	}
-
-	var key uint64
-	var qtype uint32
-	qtype = 0xffffffff
-	if uid != 0 {
-		qtype = UserQuotaType
-		key = uint64(uid)
-	} else if gid != 0 {
-		qtype = GroupQuotaType
-		key = uint64(gid)
-	} else if dpath != "" {
-		qtype = DirQuotaType
 		key = uint64(inode)
-	}
-
-	if cmd != QuotaList && cmd != QuotaCheck && qtype == 0xffffffff {
+	} else if qtype == UserQuotaType || qtype == GroupQuotaType {
+		// Parse the quotaKey in format "uid:xxx" or "gid:xxx"
+		parts := strings.Split(qkey, ":")
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid quota key format: %s", qkey)
+		}
+		id, err := strconv.ParseUint(parts[1], 10, 64)
+		if err != nil {
+			return fmt.Errorf("parse quota key: %s", err)
+		}
+		key = id
+	} else if cmd == QuotaList || cmd == QuotaCheck {
+		key = 0xffffffff
+	} else {
 		return fmt.Errorf("invalid quota type")
 	}
 

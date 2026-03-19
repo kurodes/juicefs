@@ -139,7 +139,8 @@ func quota(c *cli.Context) error {
 	}
 
 	var uid, gid uint32
-	var quotaKey, quotaType string
+	var qkey, quotaType string
+	var qtype uint32
 	validateID := func(name string) uint32 {
 		id := c.Uint64(name)
 		if id == 0 {
@@ -151,29 +152,34 @@ func quota(c *cli.Context) error {
 		return uint32(id)
 	}
 	if c.IsSet("uid") {
+		uid = validateID("uid")
+		qkey = fmt.Sprintf("uid:%d", uid)
+		quotaType = "user"
+		qtype = meta.UserQuotaType
 		if c.IsSet("gid") {
 			logger.Fatalf("Cannot specify both --uid and --gid at the same time")
 		}
 		if c.IsSet("path") {
 			logger.Fatalf("Cannot specify both --uid and --path at the same time")
 		}
-		uid = validateID("uid")
-		quotaKey = fmt.Sprintf("uid:%d", uid)
-		quotaType = "user"
 	} else if c.IsSet("gid") {
+		gid = validateID("gid")
+		qkey = fmt.Sprintf("gid:%d", gid)
+		quotaType = "group"
+		qtype = meta.GroupQuotaType
 		if c.IsSet("path") {
 			logger.Fatalf("Cannot specify both --gid and --path at the same time")
 		}
-		gid = validateID("gid")
-		quotaKey = fmt.Sprintf("gid:%d", gid)
-		quotaType = "group"
 	} else {
-		quotaKey = c.String("path")
+		qkey = c.String("path")
 		quotaType = "directory"
-		if quotaKey == "" {
+		qtype = meta.DirQuotaType
+		if qkey == "" {
 			switch cmd {
 			case meta.QuotaList:
+				qtype = 0xffffffff
 			case meta.QuotaCheck:
+				qtype = 0xffffffff
 				quotaType = "all"
 			default:
 				logger.Fatalf("Please specify the directory with `--path <dir>` option")
@@ -199,13 +205,13 @@ func quota(c *cli.Context) error {
 		if c.IsSet("inodes") {
 			q.MaxInodes = int64(c.Uint64("inodes"))
 		}
-		qs[quotaKey] = q
+		qs[qkey] = q
 	} else if cmd == meta.QuotaCheck {
 		strict = c.Bool("strict")
 		repair = c.Bool("repair")
 	}
 
-	if err := m.HandleQuota(meta.Background(), cmd, quotaKey, uid, gid, qs, strict, repair, c.Bool("create")); err != nil {
+	if err := m.HandleQuota(meta.Background(), cmd, qkey, qtype, qs, strict, repair, c.Bool("create")); err != nil {
 		return err
 	} else if len(qs) == 0 {
 		return nil
