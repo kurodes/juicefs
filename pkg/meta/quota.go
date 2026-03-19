@@ -159,13 +159,30 @@ func (m *baseMeta) calcDirStat(ctx Context, ino Ino) (*dirStat, syscall.Errno) {
 	return stat, 0
 }
 
+func (m *baseMeta) calcTrashDirStat(ctx Context) (*dirStat, syscall.Errno) {
+	var totalSpace, totalInodes int64
+	if err := m.scanTrashEntry(ctx, func(_ Ino, size uint64) {
+		totalSpace += align4K(size)
+		totalInodes++
+	}); err != nil {
+		return nil, errno(err)
+	}
+	return &dirStat{space: totalSpace, inodes: totalInodes}, 0
+}
+
 func (m *baseMeta) GetDirStat(ctx Context, inode Ino) (stat *dirStat, st syscall.Errno) {
 	stat, st = m.en.doGetDirStat(ctx, m.checkRoot(inode), !m.conf.ReadOnly)
 	if st != 0 {
 		return
 	}
+	logger.Infof("stat = %v", stat)
 	if stat == nil {
-		stat, st = m.calcDirStat(ctx, inode)
+		logger.Infof("stat == nil")
+		if inode == TrashInode {
+			stat, st = m.calcTrashDirStat(ctx)
+		} else {
+			stat, st = m.calcDirStat(ctx, inode)
+		}
 	}
 	return
 }
@@ -185,9 +202,6 @@ func (m *baseMeta) updateDirStat(ctx Context, ino Ino, length, space, inodes int
 
 func (m *baseMeta) updateTrashStats(ctx Context, trash Ino, space, inodes int64) {
 	m.updateDirStat(ctx, trash, 0, space, inodes)
-	if trash != TrashInode {
-		m.updateDirStat(ctx, TrashInode, 0, space, inodes)
-	}
 }
 
 func (m *baseMeta) updateParentStat(ctx Context, inode, parent Ino, length, space int64) {

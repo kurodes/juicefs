@@ -805,6 +805,14 @@ func (m *redisMeta) doSyncVolumeStat(ctx Context) error {
 	var used, inodes int64
 	if err := m.hscan(ctx, m.dirUsedSpaceKey(), func(keys []string) error {
 		for i := 0; i < len(keys); i += 2 {
+			ino, err := strconv.ParseInt(keys[i], 10, 64)
+			if err != nil {
+				logger.Warnf("invalid inode: %s", keys[i])
+				continue
+			}
+			if Ino(ino) == TrashInode {
+				continue
+			}
 			v, err := strconv.ParseInt(keys[i+1], 10, 64)
 			if err != nil {
 				logger.Warnf("invalid used space: %s->%s", keys[i], keys[i+1])
@@ -818,6 +826,14 @@ func (m *redisMeta) doSyncVolumeStat(ctx Context) error {
 	}
 	if err := m.hscan(ctx, m.dirUsedInodesKey(), func(keys []string) error {
 		for i := 0; i < len(keys); i += 2 {
+			ino, err := strconv.ParseInt(keys[i], 10, 64)
+			if err != nil {
+				logger.Warnf("invalid inode: %s", keys[i])
+				continue
+			}
+			if Ino(ino) == TrashInode {
+				continue
+			}
 			v, err := strconv.ParseInt(keys[i+1], 10, 64)
 			if err != nil {
 				logger.Warnf("invalid used inode: %s->%s", keys[i], keys[i+1])
@@ -876,10 +892,10 @@ func (m *redisMeta) doSyncVolumeStat(ctx Context) error {
 			}
 		}
 	}
-	// TrashInode's dirstat is already included in the dirUsedSpace/Inodes scan above, no need to scanTrashEntry separately
-	// But we need to ensure TrashInode's dirstat exists and is correct
+	// TrashInode's dirstat is an aggregate of all sub-trash directories.
+	// We skip it in the scan above to avoid double-counting.
+	// Ensure TrashInode's dirstat exists and is correct.
 	if stat, _ := m.doGetDirStat(ctx, TrashInode, false); stat == nil {
-		// TrashInode's dirstat doesn't exist, sync it
 		if err := m.syncTrashDirStat(ctx); err != nil {
 			logger.Warnf("sync TrashInode dirstat: %s", err)
 		}
@@ -2121,7 +2137,7 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, len
 			m.updateStats(batchFsDeltaSpace, batchFsDeltaInodes)
 		}
 		if batchTrashDeltaSpace != 0 || batchTrashDeltaInodes != 0 {
-			m.updateTrashStats(ctx, parent, batchTrashDeltaSpace, batchTrashDeltaInodes)
+			m.updateTrashStats(ctx, trash, batchTrashDeltaSpace, batchTrashDeltaInodes)
 		}
 
 		totalLength += batchLength
@@ -2266,7 +2282,7 @@ func (m *redisMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, o
 func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode, tInode *Ino, attr, tAttr *Attr) syscall.Errno {
 	exchange := flags == RenameExchange
 	var opened bool
-	var trash, dino Ino
+	var trash, dino, dstTrash Ino
 	var dtyp uint8
 	var tattr Attr
 	var newSpace, newInode int64
@@ -2284,7 +2300,7 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 	}
 	err := m.txn(ctx, func(tx *redis.Tx) error {
 		opened = false
-		dino, dtyp = 0, 0
+		dino, dtyp, dstTrash = 0, 0, 0
 		tattr = Attr{}
 		newSpace, newInode = 0, 0
 		buf, err := tx.HGet(ctx, m.entryKey(parentSrc), nameSrc).Bytes()
@@ -2511,6 +2527,7 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 					if trash > 0 {
 						pipe.Set(ctx, m.inodeKey(dino), m.marshal(&tattr), 0)
 						pipe.HSet(ctx, m.entryKey(trash), m.trashEntry(parentDst, dino, nameDst), dbuf)
+						dstTrash = trash
 						if tattr.Parent == 0 {
 							pipe.HIncrBy(ctx, m.parentKey(dino), trash.String(), 1)
 							pipe.HIncrBy(ctx, m.parentKey(dino), parentDst.String(), -1)
@@ -2577,29 +2594,61 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 		})
 		return err
 	}, keys...)
-	if err == nil && !exchange {
-		if parentSrc.IsTrash() {
-			var restoreSpace, restoreInodes int64
-			if srcType == TypeFile {
-				restoreSpace = -align4K(srcLength)
-			} else {
-				restoreSpace = -align4K(0)
+	if err == nil {
+		srcSpace := align4K(0)
+		if srcType == TypeFile {
+			srcSpace = align4K(srcLength)
+		}
+		if exchange {
+			if dino > 0 && parentSrc != parentDst {
+				dstSpace := align4K(0)
+				if dtyp == TypeFile {
+					dstSpace = align4K(tattr.Length)
+				}
+				if parentSrc.IsTrash() {
+					deltaSpace, deltaInodes := -srcSpace, int64(-1)
+					if parentDst.IsTrash() {
+						deltaSpace += dstSpace
+						deltaInodes++
+					}
+					m.updateTrashStats(ctx, parentSrc, deltaSpace, deltaInodes)
+				}
+				if parentDst.IsTrash() {
+					deltaSpace, deltaInodes := -dstSpace, int64(-1)
+					if parentSrc.IsTrash() {
+						deltaSpace += srcSpace
+						deltaInodes++
+					}
+					m.updateTrashStats(ctx, parentDst, deltaSpace, deltaInodes)
+				}
 			}
-			restoreInodes = -1
-			if trash > 0 {
-				restoreSpace += newSpace
-				restoreInodes += newInode
-			} else {
-				m.updateStats(newSpace, newInode)
-			}
-			m.updateTrashStats(ctx, parentSrc, restoreSpace, restoreInodes)
-		} else if trash == 0 {
-			if dino > 0 && dtyp == TypeFile && tattr.Nlink == 0 {
+		} else {
+			if dino > 0 && dtyp == TypeFile && tattr.Nlink == 0 && trash == 0 {
 				m.fileDeleted(opened, false, dino, tattr.Length)
 			}
-			m.updateStats(newSpace, newInode)
-		} else {
-			m.updateTrashStats(ctx, trash, newSpace, newInode)
+
+			if parentSrc.IsTrash() {
+				deltaSpace, deltaInodes := -srcSpace, int64(-1)
+				if parentDst.IsTrash() {
+					deltaSpace += srcSpace
+					deltaInodes++
+				}
+				m.updateTrashStats(ctx, parentSrc, deltaSpace, deltaInodes)
+			}
+			if !parentSrc.IsTrash() && parentDst.IsTrash() {
+				m.updateTrashStats(ctx, parentDst, srcSpace, 1)
+			}
+
+			if dino > 0 {
+				if dstTrash > 0 {
+					m.updateTrashStats(ctx, dstTrash, newSpace, newInode)
+				} else {
+					m.updateStats(newSpace, newInode)
+					if parentDst.IsTrash() && (newSpace != 0 || newInode != 0) {
+						m.updateTrashStats(ctx, parentDst, newSpace, newInode)
+					}
+				}
+			}
 		}
 	}
 	return errno(err)

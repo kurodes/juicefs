@@ -1162,15 +1162,29 @@ func (m *baseMeta) statRootFs(ctx Context, totalspace, availspace, iused, iavail
 }
 
 func (m *baseMeta) GetTrashStats(ctx Context) (space int64, inodes int64) {
-	stat, st := m.GetDirStat(ctx, TrashInode)
+	var entries []*Entry
+	st := m.en.doReaddir(ctx, TrashInode, 0, &entries, -1)
 	if st != 0 {
-		logger.Warnf("GetDirStat for TrashInode: %s", st)
+		if st != syscall.ENOENT {
+			logger.Warnf("Readdir for TrashInode: %s", st)
+		}
 		return 0, 0
 	}
-	if stat == nil {
-		return 0, 0
+	for _, entry := range entries {
+		stat, st := m.GetDirStat(ctx, entry.Inode)
+		if st != 0 {
+			logger.Warnf("GetDirStat for trash subdir %d: %s", entry.Inode, st)
+			continue
+		}
+		if stat == nil {
+			logger.Infof("trash subdir %d stat is nil", entry.Inode)
+			continue
+		}
+		logger.Infof("trash subdir %d stat = %v", entry.Inode, stat)
+		space += stat.space
+		inodes += stat.inodes
 	}
-	return stat.space, stat.inodes
+	return space, inodes
 }
 
 func (m *baseMeta) syncTrashDirStat(ctx Context) error {

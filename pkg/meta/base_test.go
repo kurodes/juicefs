@@ -4968,8 +4968,11 @@ func testBatchUnlinkTrashHardlinkUGQuotaCombo(t *testing.T, m Meta, ctx Context,
 	format.TrashDays = 1
 	defer func() { format.TrashDays = oldTrashDays }()
 
-	if err := m.HandleQuota(ctx, QuotaSet, "", uid, gid, map[string]*Quota{UGQuotaKey: {MaxSpace: 100 << 20, MaxInodes: 100}}, false, false, false); err != nil {
-		t.Fatalf("Set user group quota: %s", err)
+	if err := m.HandleQuota(ctx, QuotaSet, "", uid, 0, map[string]*Quota{fmt.Sprintf("uid:%d", uid): {MaxSpace: 100 << 20, MaxInodes: 100}}, false, false, false); err != nil {
+		t.Fatalf("Set user quota: %s", err)
+	}
+	if err := m.HandleQuota(ctx, QuotaSet, "", 0, gid, map[string]*Quota{fmt.Sprintf("gid:%d", gid): {MaxSpace: 100 << 20, MaxInodes: 100}}, false, false, false); err != nil {
+		t.Fatalf("Set group quota: %s", err)
 	}
 
 	baseName := "combo_base"
@@ -5008,12 +5011,12 @@ func testBatchUnlinkTrashHardlinkUGQuotaCombo(t *testing.T, m Meta, ctx Context,
 	time.Sleep(200 * time.Millisecond)
 
 	qs := make(map[string]*Quota)
-	if err := m.HandleQuota(ctx, QuotaGet, "", uid, gid, qs, false, false, false); err != nil {
-		t.Fatalf("Get UG quota before batch unlink hardlinks: %s", err)
+	if err := m.HandleQuota(ctx, QuotaGet, "", uid, 0, qs, false, false, false); err != nil {
+		t.Fatalf("Get user quota before batch unlink hardlinks: %s", err)
 	}
-	ugBefore := qs[UGQuotaKey]
+	ugBefore := qs[fmt.Sprintf("uid:%d", uid)]
 	if ugBefore == nil {
-		t.Fatalf("UG quota not found before batch unlink hardlinks")
+		t.Fatalf("User quota not found before batch unlink hardlinks")
 	}
 
 	trashSpaceBefore, trashInodesBefore := m.GetTrashStats(ctx)
@@ -5040,12 +5043,12 @@ func testBatchUnlinkTrashHardlinkUGQuotaCombo(t *testing.T, m Meta, ctx Context,
 	time.Sleep(200 * time.Millisecond)
 
 	qs = make(map[string]*Quota)
-	if err := m.HandleQuota(ctx, QuotaGet, "", uid, gid, qs, false, false, false); err != nil {
-		t.Fatalf("Get UG quota after batch unlink hardlinks: %s", err)
+	if err := m.HandleQuota(ctx, QuotaGet, "", uid, 0, qs, false, false, false); err != nil {
+		t.Fatalf("Get user quota after batch unlink hardlinks: %s", err)
 	}
-	ugAfter := qs[UGQuotaKey]
+	ugAfter := qs[fmt.Sprintf("uid:%d", uid)]
 	if ugAfter == nil {
-		t.Fatalf("UG quota not found after batch unlink hardlinks")
+		t.Fatalf("User quota not found after batch unlink hardlinks")
 	}
 
 	if ugBefore.UsedInodes-ugAfter.UsedInodes != int64(len(linkNames)) {
@@ -6109,6 +6112,7 @@ func testTrashStats(t *testing.T, m Meta, ctx Context, root Ino) {
 
 		trashSpaceAfterRestore, trashInodesAfterRestore := m.GetTrashStats(ctx)
 		expectedTrashSpaceDelta := int64(align4K(dstSize) - align4K(srcSize))
+		logger.Infof("trashspacea before = %d, delta = %d, after = %d", trashSpaceBeforeRestore, expectedTrashSpaceDelta, trashSpaceAfterRestore)
 		if trashSpaceAfterRestore != trashSpaceBeforeRestore+expectedTrashSpaceDelta {
 			t.Fatalf("Trash space mismatch after restore overwrite destination: expected %d, got %d", trashSpaceBeforeRestore+expectedTrashSpaceDelta, trashSpaceAfterRestore)
 		}
