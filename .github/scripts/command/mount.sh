@@ -662,8 +662,7 @@ test_sm4gcm_encrypt_basic() {
     _verify_files_match /tmp/sm4gcm_src /jfs 10
 
     # Remount and verify again
-    ./juicefs umount /jfs || umount -l /jfs
-    sleep 3
+    umount_jfs /jfs "$META_URL"
     ./juicefs mount -d $META_URL /jfs
     _verify_files_match /tmp/sm4gcm_src /jfs 10
 
@@ -685,8 +684,7 @@ test_sm4gcm_encrypt_with_passphrase() {
     [[ "$content" != "hello-sm4gcm-encrypted" ]] && echo "FAIL: content mismatch: $content" && exit 1
 
     # Remount with passphrase and verify
-    ./juicefs umount /jfs || umount -l /jfs
-    sleep 3
+    umount_jfs /jfs "$META_URL"
     JFS_RSA_PASSPHRASE=mypassword ./juicefs mount -d $META_URL /jfs
     content=$(cat /jfs/test.txt)
     [[ "$content" != "hello-sm4gcm-encrypted" ]] && echo "FAIL: content mismatch after remount: $content" && exit 1
@@ -711,8 +709,7 @@ test_sm4gcm_encrypt_large_files() {
     [[ "$md5_src" != "$md5_dst" ]] && echo "FAIL: large file md5 mismatch" && exit 1
 
     # Remount and verify
-    ./juicefs umount /jfs || umount -l /jfs
-    sleep 3
+    umount_jfs /jfs "$META_URL"
     ./juicefs mount -d $META_URL /jfs
     md5_dst2=$(md5sum /jfs/largefile | awk '{print $1}')
     [[ "$md5_src" != "$md5_dst2" ]] && echo "FAIL: large file md5 mismatch after remount" && exit 1
@@ -775,8 +772,7 @@ test_sm4gcm_encrypt_with_compress() {
     [[ "$md5_src" != "$md5_dst" ]] && echo "FAIL: compress+encrypt md5 mismatch" && exit 1
 
     # Remount and verify
-    ./juicefs umount /jfs || umount -l /jfs
-    sleep 3
+    umount_jfs /jfs "$META_URL"
     ./juicefs mount -d $META_URL /jfs
     md5_dst2=$(md5sum /jfs/compress_test.txt | awk '{print $1}')
     [[ "$md5_src" != "$md5_dst2" ]] && echo "FAIL: compress+encrypt md5 mismatch after remount" && exit 1
@@ -845,8 +841,7 @@ test_encrypt_algo_comparison() {
         [[ "$md5_src" != "$md5_dst" ]] && echo "FAIL: $algo md5 mismatch: $md5_src vs $md5_dst" && exit 1
 
         # Remount and verify
-        ./juicefs umount /jfs || umount -l /jfs
-        sleep 3
+        umount_jfs /jfs "$META_URL"
         ./juicefs mount -d $META_URL /jfs
         md5_dst2=$(md5sum /jfs/testfile | awk '{print $1}')
         [[ "$md5_src" != "$md5_dst2" ]] && echo "FAIL: $algo md5 mismatch after remount" && exit 1
@@ -939,8 +934,7 @@ test_sm4gcm_sm2_key_with_aes_algo() {
     [[ "$md5_src" != "$md5_dst" ]] && echo "FAIL: SM2+AES md5 mismatch" && exit 1
 
     # Remount and verify
-    ./juicefs umount /jfs || umount -l /jfs
-    sleep 3
+    umount_jfs /jfs "$META_URL"
     ./juicefs mount -d $META_URL /jfs
     md5_dst2=$(md5sum /jfs/testfile | awk '{print $1}')
     [[ "$md5_src" != "$md5_dst2" ]] && echo "FAIL: SM2+AES md5 mismatch after remount" && exit 1
