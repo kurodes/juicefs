@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"math"
 	"sort"
-	"strings"
 
 	"github.com/dustin/go-humanize"
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -153,7 +152,7 @@ func quota(c *cli.Context) error {
 	}
 	if c.IsSet("uid") {
 		uid = validateID("uid")
-		qkey = fmt.Sprintf("uid:%d", uid)
+		qkey = fmt.Sprintf("%d", uid)
 		quotaType = "user"
 		qtype = meta.UserQuotaType
 		if c.IsSet("gid") {
@@ -164,7 +163,7 @@ func quota(c *cli.Context) error {
 		}
 	} else if c.IsSet("gid") {
 		gid = validateID("gid")
-		qkey = fmt.Sprintf("gid:%d", gid)
+		qkey = fmt.Sprintf("%d", gid)
 		quotaType = "group"
 		qtype = meta.GroupQuotaType
 		if c.IsSet("path") {
@@ -261,10 +260,10 @@ func printQuotaResult(quotaType string, qs map[string]*meta.Quota) {
 		}
 
 		identifier := p
-		if strings.HasPrefix(p, "uid:") {
-			identifier = fmt.Sprintf("UID:%s", strings.TrimPrefix(p, "uid:"))
-		} else if strings.HasPrefix(p, "gid:") {
-			identifier = fmt.Sprintf("GID:%s", strings.TrimPrefix(p, "gid:"))
+		if quotaType == "user" {
+			identifier = fmt.Sprintf("UID:%s", p)
+		} else if quotaType == "group" {
+			identifier = fmt.Sprintf("GID:%s", p)
 		}
 		result = append(result, []string{identifier, size, used, usedR, itotal, iused, iusedR})
 	}

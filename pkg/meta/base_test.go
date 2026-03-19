@@ -4054,7 +4054,7 @@ func testCheckQuotaFileOwnerSimple(t *testing.T, m Meta) {
 	format := m.getBase().getFormat()
 	format.UserGroupQuota = true
 
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", fileOwnerUid): {MaxSpace: 4096, MaxInodes: 5}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", fileOwnerUid): {MaxSpace: 4096, MaxInodes: 5}}, false, false, false); err != nil {
 		t.Fatalf("HandleQuota set user quota: %s", err)
 	}
 	m.getBase().loadQuotas()
@@ -4104,7 +4104,7 @@ func testQuotaEdgeCases(t *testing.T, m Meta) {
 	format.UserGroupQuota = true
 
 	t.Log("Testing inodes-only quota limit...")
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", fileOwnerUid): {MaxSpace: 0, MaxInodes: 2}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", fileOwnerUid): {MaxSpace: 0, MaxInodes: 2}}, false, false, false); err != nil {
 		t.Fatalf("HandleQuota set inodes-only quota: %s", err)
 	}
 	m.getBase().loadQuotas()
@@ -4120,7 +4120,7 @@ func testQuotaEdgeCases(t *testing.T, m Meta) {
 	}
 
 	t.Log("Testing space-only quota limit...")
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", fileOwnerUid): {MaxSpace: 1024 * 1024, MaxInodes: 0}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", fileOwnerUid): {MaxSpace: 1024 * 1024, MaxInodes: 0}}, false, false, false); err != nil {
 		t.Fatalf("HandleQuota set space-only quota: %s", err)
 	}
 	m.getBase().loadQuotas()
@@ -4148,7 +4148,7 @@ func testQuotaEdgeCasesComplex(t *testing.T, m Meta) {
 	format.UserGroupQuota = true
 
 	t.Log("Testing inodes-only quota limit...")
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", fileOwnerUid): {MaxSpace: 0, MaxInodes: 2}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", fileOwnerUid): {MaxSpace: 0, MaxInodes: 2}}, false, false, false); err != nil {
 		t.Fatalf("HandleQuota set inodes-only quota: %s", err)
 	}
 	m.getBase().loadQuotas()
@@ -4180,7 +4180,7 @@ func testQuotaEdgeCasesComplex(t *testing.T, m Meta) {
 	}
 
 	t.Log("Testing space-only quota limit...")
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", fileOwnerUid): {MaxSpace: 1024 * 1024, MaxInodes: 0}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", fileOwnerUid): {MaxSpace: 1024 * 1024, MaxInodes: 0}}, false, false, false); err != nil {
 		t.Fatalf("HandleQuota set space-only quota: %s", err)
 	}
 	m.getBase().loadQuotas()
@@ -4231,10 +4231,10 @@ func testCheckQuotaFileOwner(t *testing.T, m Meta) {
 	operatorGid := uint32(2002)
 
 	t.Run("FileOwnerQuotaCheck", func(t *testing.T) {
-		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", fileOwnerUid): {MaxSpace: 1 << 20, MaxInodes: 5}}, false, false, false); err != nil {
+		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", fileOwnerUid): {MaxSpace: 1 << 20, MaxInodes: 5}}, false, false, false); err != nil {
 			t.Fatalf("HandleQuota set user quota for file owner uid %d: %s", fileOwnerUid, err)
 		}
-		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("gid:%d", fileOwnerGid), GroupQuotaType, map[string]*Quota{fmt.Sprintf("gid:%d", fileOwnerGid): {MaxSpace: 2 << 20, MaxInodes: 10}}, false, false, false); err != nil {
+		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("gid:%d", fileOwnerGid), GroupQuotaType, map[string]*Quota{fmt.Sprintf("%d", fileOwnerGid): {MaxSpace: 2 << 20, MaxInodes: 10}}, false, false, false); err != nil {
 			t.Fatalf("HandleQuota set group quota for file owner gid %d: %s", fileOwnerGid, err)
 		}
 		m.getBase().loadQuotas()
@@ -4271,7 +4271,7 @@ func testCheckQuotaFileOwner(t *testing.T, m Meta) {
 		if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, qs, false, false, false); err != nil {
 			t.Fatalf("HandleQuota get user quota: %s", err)
 		}
-		if q := qs[fmt.Sprintf("uid:%d", fileOwnerUid)]; q.UsedSpace < 1024 {
+		if q := qs[fmt.Sprintf("%d", fileOwnerUid)]; q.UsedSpace < 1024 {
 			t.Fatalf("User quota used space should be >= 1024, got %d", q.UsedSpace)
 		}
 
@@ -4279,13 +4279,13 @@ func testCheckQuotaFileOwner(t *testing.T, m Meta) {
 		if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("gid:%d", fileOwnerGid), GroupQuotaType, qs, false, false, false); err != nil {
 			t.Fatalf("HandleQuota get group quota: %s", err)
 		}
-		if q := qs[fmt.Sprintf("gid:%d", fileOwnerGid)]; q.UsedSpace < 1024 {
+		if q := qs[fmt.Sprintf("%d", fileOwnerGid)]; q.UsedSpace < 1024 {
 			t.Fatalf("Group quota used space should be >= 1024, got %d", q.UsedSpace)
 		}
 	})
 
 	t.Run("QuotaExceededByFileOwner", func(t *testing.T) {
-		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", fileOwnerUid): {MaxSpace: 1024, MaxInodes: 2}}, false, false, false); err != nil {
+		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", fileOwnerUid): {MaxSpace: 1024, MaxInodes: 2}}, false, false, false); err != nil {
 			t.Fatalf("HandleQuota set strict user quota: %s", err)
 		}
 		m.getBase().loadQuotas()
@@ -4319,7 +4319,7 @@ func testCheckQuotaFileOwner(t *testing.T, m Meta) {
 	})
 
 	t.Run("TruncateQuotaCheck", func(t *testing.T) {
-		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", fileOwnerUid): {MaxSpace: 1 << 20, MaxInodes: 10}}, false, false, false); err != nil {
+		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", fileOwnerUid): {MaxSpace: 1 << 20, MaxInodes: 10}}, false, false, false); err != nil {
 			t.Fatalf("HandleQuota reset user quota: %s", err)
 		}
 		m.getBase().loadQuotas()
@@ -4353,7 +4353,7 @@ func testCheckQuotaFileOwner(t *testing.T, m Meta) {
 	})
 
 	t.Run("MknodQuotaCheck", func(t *testing.T) {
-		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", fileOwnerUid): {MaxSpace: 1 << 20, MaxInodes: 10}}, false, false, false); err != nil {
+		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", fileOwnerUid): {MaxSpace: 1 << 20, MaxInodes: 10}}, false, false, false); err != nil {
 			t.Fatalf("HandleQuota reset user quota: %s", err)
 		}
 		m.getBase().loadQuotas()
@@ -4373,7 +4373,7 @@ func testCheckQuotaFileOwner(t *testing.T, m Meta) {
 	})
 
 	t.Run("CloneQuotaCheck", func(t *testing.T) {
-		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", fileOwnerUid): {MaxSpace: 1 << 20, MaxInodes: 10}}, false, false, false); err != nil {
+		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", fileOwnerUid): {MaxSpace: 1 << 20, MaxInodes: 10}}, false, false, false); err != nil {
 			t.Fatalf("HandleQuota reset user quota: %s", err)
 		}
 		m.getBase().loadQuotas()
@@ -4407,10 +4407,10 @@ func testCheckQuotaFileOwner(t *testing.T, m Meta) {
 	})
 
 	t.Run("CrossUserOperations", func(t *testing.T) {
-		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", fileOwnerUid): {MaxSpace: 1 << 20, MaxInodes: 10}}, false, false, false); err != nil {
+		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", fileOwnerUid): {MaxSpace: 1 << 20, MaxInodes: 10}}, false, false, false); err != nil {
 			t.Fatalf("HandleQuota set file owner quota: %s", err)
 		}
-		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", operatorUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", operatorUid): {MaxSpace: 512, MaxInodes: 2}}, false, false, false); err != nil {
+		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", operatorUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", operatorUid): {MaxSpace: 512, MaxInodes: 2}}, false, false, false); err != nil {
 			t.Fatalf("HandleQuota set operator quota: %s", err)
 		}
 		m.getBase().loadQuotas()
@@ -4437,7 +4437,7 @@ func testCheckQuotaFileOwner(t *testing.T, m Meta) {
 		if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, qs, false, false, false); err != nil {
 			t.Fatalf("HandleQuota get file owner quota: %s", err)
 		}
-		if q := qs[fmt.Sprintf("uid:%d", fileOwnerUid)]; q.UsedSpace < 1024 {
+		if q := qs[fmt.Sprintf("%d", fileOwnerUid)]; q.UsedSpace < 1024 {
 			t.Fatalf("File owner quota should be used: expected >= 1024, got %d", q.UsedSpace)
 		}
 
@@ -4445,7 +4445,7 @@ func testCheckQuotaFileOwner(t *testing.T, m Meta) {
 		if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("uid:%d", operatorUid), UserQuotaType, qs, false, false, false); err != nil {
 			t.Fatalf("HandleQuota get operator quota: %s", err)
 		}
-		if q := qs[fmt.Sprintf("uid:%d", operatorUid)]; q.UsedSpace > 0 {
+		if q := qs[fmt.Sprintf("%d", operatorUid)]; q.UsedSpace > 0 {
 			t.Fatalf("Operator quota should not be used for file owner's file: got %d", q.UsedSpace)
 		}
 
@@ -4453,7 +4453,7 @@ func testCheckQuotaFileOwner(t *testing.T, m Meta) {
 	})
 
 	t.Run("EdgeCases", func(t *testing.T) {
-		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", fileOwnerUid): {MaxSpace: 0, MaxInodes: 0}}, false, false, false); err != nil {
+		if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", fileOwnerUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", fileOwnerUid): {MaxSpace: 0, MaxInodes: 0}}, false, false, false); err != nil {
 			t.Fatalf("HandleQuota set zero quota: %s", err)
 		}
 		m.getBase().loadQuotas()
@@ -4530,12 +4530,12 @@ func cleanupQuotaTest(ctx Context, m Meta, parent Ino, uid, gid uint32) {
 }
 
 func testBasicQuotaOperations(t *testing.T, m Meta, ctx Context, uid, gid uint32) {
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", uid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", uid): {MaxSpace: 1 << 30, MaxInodes: 10}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", uid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", uid): {MaxSpace: 1 << 30, MaxInodes: 10}}, false, false, false); err != nil {
 		t.Fatalf("HandleQuota set user quota for uid %d: %s", uid, err)
 	}
 	m.getBase().loadQuotas()
 
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("gid:%d", gid), GroupQuotaType, map[string]*Quota{fmt.Sprintf("gid:%d", gid): {MaxSpace: 2 << 30, MaxInodes: 20}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("gid:%d", gid), GroupQuotaType, map[string]*Quota{fmt.Sprintf("%d", gid): {MaxSpace: 2 << 30, MaxInodes: 20}}, false, false, false); err != nil {
 		t.Fatalf("HandleQuota set group quota for gid %d: %s", gid, err)
 	}
 	m.getBase().loadQuotas()
@@ -4543,14 +4543,14 @@ func testBasicQuotaOperations(t *testing.T, m Meta, ctx Context, uid, gid uint32
 	qs := make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("uid:%d", uid), UserQuotaType, qs, false, false, false); err != nil {
 		t.Fatalf("HandleQuota get user quota for uid %d: %s", uid, err)
-	} else if q := qs[fmt.Sprintf("uid:%d", uid)]; q.MaxSpace != 1<<30 || q.MaxInodes != 10 {
+	} else if q := qs[fmt.Sprintf("%d", uid)]; q.MaxSpace != 1<<30 || q.MaxInodes != 10 {
 		t.Fatalf("HandleQuota get user quota for uid %d: bad result %+v", uid, q)
 	}
 
 	qs = make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("gid:%d", gid), GroupQuotaType, qs, false, false, false); err != nil {
 		t.Fatalf("HandleQuota get group quota for gid %d: %s", gid, err)
-	} else if q := qs[fmt.Sprintf("gid:%d", gid)]; q.MaxSpace != 2<<30 || q.MaxInodes != 20 {
+	} else if q := qs[fmt.Sprintf("%d", gid)]; q.MaxSpace != 2<<30 || q.MaxInodes != 20 {
 		t.Fatalf("HandleQuota get group quota for gid %d: bad result %+v", gid, q)
 	}
 
@@ -4614,35 +4614,35 @@ func testQuotaFileOperations(t *testing.T, m Meta, ctx Context, parent Ino, uid,
 	if err := m.HandleQuota(ctx, QuotaDel, fmt.Sprintf("uid:%d", uid), UserQuotaType, nil, false, false, false); err != nil {
 		t.Logf("HandleQuota delete user quota (may not exist): %s", err)
 	}
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", uid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", uid): {MaxSpace: 1 << 30, MaxInodes: 10}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", uid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", uid): {MaxSpace: 1 << 30, MaxInodes: 10}}, false, false, false); err != nil {
 		t.Fatalf("HandleQuota set user quota for uid %d: %s", uid, err)
 	}
 
 	qs := make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("uid:%d", uid), UserQuotaType, qs, false, false, false); err != nil {
 		t.Fatalf("HandleQuota get user quota after file creation: %s", err)
-	} else if q := qs[fmt.Sprintf("uid:%d", uid)]; q.UsedInodes < 1 {
+	} else if q := qs[fmt.Sprintf("%d", uid)]; q.UsedInodes < 1 {
 		t.Fatalf("HandleQuota get user quota: used inodes should be >= 1, got %d", q.UsedInodes)
 	}
 
 	if err := m.HandleQuota(ctx, QuotaDel, fmt.Sprintf("gid:%d", gid), GroupQuotaType, nil, false, false, false); err != nil {
 		t.Logf("HandleQuota delete group quota (may not exist): %s", err)
 	}
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("gid:%d", gid), GroupQuotaType, map[string]*Quota{fmt.Sprintf("gid:%d", gid): {MaxSpace: 2 << 30, MaxInodes: 20}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("gid:%d", gid), GroupQuotaType, map[string]*Quota{fmt.Sprintf("%d", gid): {MaxSpace: 2 << 30, MaxInodes: 20}}, false, false, false); err != nil {
 		t.Fatalf("HandleQuota set group quota for gid %d: %s", gid, err)
 	}
 
 	qs = make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("uid:%d", uid), UserQuotaType, qs, false, false, false); err != nil {
 		t.Fatalf("HandleQuota get user quota after file creation: %s", err)
-	} else if q := qs[fmt.Sprintf("uid:%d", uid)]; q.UsedInodes < 1 {
+	} else if q := qs[fmt.Sprintf("%d", uid)]; q.UsedInodes < 1 {
 		t.Fatalf("HandleQuota get user quota: used inodes should be >= 1, got %d", q.UsedInodes)
 	}
 
 	qs = make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("gid:%d", gid), GroupQuotaType, qs, false, false, false); err != nil {
 		t.Fatalf("HandleQuota get group quota after file creation: %s", err)
-	} else if q := qs[fmt.Sprintf("gid:%d", gid)]; q.UsedInodes < 1 {
+	} else if q := qs[fmt.Sprintf("%d", gid)]; q.UsedInodes < 1 {
 		t.Fatalf("HandleQuota get group quota: used inodes should be >= 1, got %d", q.UsedInodes)
 	}
 
@@ -4659,15 +4659,15 @@ func testQuotaErrorCases(t *testing.T, m Meta, ctx Context, uid, gid uint32) {
 		t.Fatalf("HandleQuota should fail for invalid command")
 	}
 
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", uid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", uid): {MaxSpace: 0, MaxInodes: 10}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", uid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", uid): {MaxSpace: 0, MaxInodes: 10}}, false, false, false); err != nil {
 		t.Fatalf("HandleQuota set user quota with MaxSpace=0: %s", err)
 	}
 
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("gid:%d", gid), GroupQuotaType, map[string]*Quota{fmt.Sprintf("gid:%d", gid): {MaxSpace: 1 << 30, MaxInodes: 0}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("gid:%d", gid), GroupQuotaType, map[string]*Quota{fmt.Sprintf("%d", gid): {MaxSpace: 1 << 30, MaxInodes: 0}}, false, false, false); err != nil {
 		t.Fatalf("HandleQuota set group quota with MaxInodes=0: %s", err)
 	}
 
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", uid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", uid): {MaxSpace: 1 << 62, MaxInodes: 1 << 30}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", uid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", uid): {MaxSpace: 1 << 62, MaxInodes: 1 << 30}}, false, false, false); err != nil {
 		t.Fatalf("HandleQuota set user quota with large values: %s", err)
 	}
 
@@ -4689,7 +4689,7 @@ func testQuotaConcurrentOperations(t *testing.T, m Meta, ctx Context) {
 		go func(id int) {
 			defer wg.Done()
 			testUid := uint32(3000 + id)
-			err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", testUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", testUid): {MaxSpace: 1 << 20, MaxInodes: 5}}, false, false, false)
+			err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", testUid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", testUid): {MaxSpace: 1 << 20, MaxInodes: 5}}, false, false, false)
 			if err != nil {
 				t.Errorf("Concurrent HandleQuota set user quota for uid %d: %s", testUid, err)
 			}
@@ -4775,14 +4775,14 @@ func testQuotaUsageStatistics(t *testing.T, m Meta, ctx Context, parent Ino, uid
 	if err := m.HandleQuota(ctx, QuotaDel, fmt.Sprintf("uid:%d", uid), UserQuotaType, nil, false, false, false); err != nil {
 		t.Logf("HandleQuota delete user quota (may not exist): %s", err)
 	}
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", uid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", uid): {MaxSpace: 1 << 30, MaxInodes: 10}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", uid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", uid): {MaxSpace: 1 << 30, MaxInodes: 10}}, false, false, false); err != nil {
 		t.Fatalf("HandleQuota set user quota for uid %d: %s", uid, err)
 	}
 
 	if err := m.HandleQuota(ctx, QuotaDel, fmt.Sprintf("gid:%d", gid), GroupQuotaType, nil, false, false, false); err != nil {
 		t.Logf("HandleQuota delete group quota (may not exist): %s", err)
 	}
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("gid:%d", gid), GroupQuotaType, map[string]*Quota{fmt.Sprintf("gid:%d", gid): {MaxSpace: 2 << 30, MaxInodes: 20}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("gid:%d", gid), GroupQuotaType, map[string]*Quota{fmt.Sprintf("%d", gid): {MaxSpace: 2 << 30, MaxInodes: 20}}, false, false, false); err != nil {
 		t.Fatalf("HandleQuota set group quota for gid %d: %s", gid, err)
 	}
 
@@ -4791,14 +4791,14 @@ func testQuotaUsageStatistics(t *testing.T, m Meta, ctx Context, parent Ino, uid
 	qs := make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("uid:%d", uid), UserQuotaType, qs, false, false, false); err != nil {
 		t.Fatalf("HandleQuota get user quota for usage verification: %s", err)
-	} else if q := qs[fmt.Sprintf("uid:%d", uid)]; q.UsedInodes < 4 {
+	} else if q := qs[fmt.Sprintf("%d", uid)]; q.UsedInodes < 4 {
 		t.Fatalf("HandleQuota user quota usage: expected >= 4 inodes, got %d", q.UsedInodes)
 	}
 
 	qs = make(map[string]*Quota)
 	if err := m.HandleQuota(ctx, QuotaGet, fmt.Sprintf("gid:%d", gid), GroupQuotaType, qs, false, false, false); err != nil {
 		t.Fatalf("HandleQuota get group quota for usage verification: %s", err)
-	} else if q := qs[fmt.Sprintf("gid:%d", gid)]; q.UsedInodes < 5 {
+	} else if q := qs[fmt.Sprintf("%d", gid)]; q.UsedInodes < 5 {
 		t.Fatalf("HandleQuota group quota usage: expected >= 5 inodes, got %d", q.UsedInodes)
 	}
 }
@@ -4864,10 +4864,10 @@ func testUserGroupQuota(t *testing.T, m Meta) {
 }
 
 func testHardlinkQuota(t *testing.T, m Meta, ctx Context, parent Ino, uid, gid uint32) {
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", uid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", uid): {MaxSpace: 100 << 20, MaxInodes: 100}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", uid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", uid): {MaxSpace: 100 << 20, MaxInodes: 100}}, false, false, false); err != nil {
 		t.Fatalf("Set user quota: %s", err)
 	}
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("gid:%d", gid), GroupQuotaType, map[string]*Quota{fmt.Sprintf("gid:%d", gid): {MaxSpace: 100 << 20, MaxInodes: 100}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("gid:%d", gid), GroupQuotaType, map[string]*Quota{fmt.Sprintf("%d", gid): {MaxSpace: 100 << 20, MaxInodes: 100}}, false, false, false); err != nil {
 		t.Fatalf("Set group quota: %s", err)
 	}
 
@@ -4910,7 +4910,7 @@ func testHardlinkQuota(t *testing.T, m Meta, ctx Context, parent Ino, uid, gid u
 	if err := m.HandleQuota(ctx, QuotaGet, "", 0, qs, false, false, false); err != nil {
 		t.Fatalf("Get user group quota after file creation: %s", err)
 	}
-	ugQuotaAfterFile := qs[fmt.Sprintf("uid:%d", uid)]
+	ugQuotaAfterFile := qs[fmt.Sprintf("%d", uid)]
 	if ugQuotaAfterFile == nil {
 		t.Fatalf("User group quota not found after file creation")
 	}
@@ -4935,7 +4935,7 @@ func testHardlinkQuota(t *testing.T, m Meta, ctx Context, parent Ino, uid, gid u
 	if err := m.HandleQuota(ctx, QuotaGet, "", 0, qs, false, false, false); err != nil {
 		t.Fatalf("Get user group quota after hardlink creation: %s", err)
 	}
-	ugQuotaAfterHardlink := qs[fmt.Sprintf("uid:%d", uid)]
+	ugQuotaAfterHardlink := qs[fmt.Sprintf("%d", uid)]
 	if ugQuotaAfterHardlink == nil {
 		t.Fatalf("User group quota not found after hardlink creation")
 	}
@@ -4987,7 +4987,7 @@ func testHardlinkQuota(t *testing.T, m Meta, ctx Context, parent Ino, uid, gid u
 	if err := m.HandleQuota(ctx, QuotaGet, "", 0, qs, false, false, false); err != nil {
 		t.Fatalf("Get user group quota after hardlink deletion: %s", err)
 	}
-	ugQuotaAfterUnlink := qs[fmt.Sprintf("uid:%d", uid)]
+	ugQuotaAfterUnlink := qs[fmt.Sprintf("%d", uid)]
 	if ugQuotaAfterUnlink == nil {
 		t.Fatalf("User group quota not found after hardlink deletion")
 	}
@@ -5036,10 +5036,10 @@ func testHardlinkQuota(t *testing.T, m Meta, ctx Context, parent Ino, uid, gid u
 }
 
 func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent Ino, uid, gid uint32) {
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", uid), UserQuotaType, map[string]*Quota{fmt.Sprintf("uid:%d", uid): {MaxSpace: 100 << 20, MaxInodes: 100}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("uid:%d", uid), UserQuotaType, map[string]*Quota{fmt.Sprintf("%d", uid): {MaxSpace: 100 << 20, MaxInodes: 100}}, false, false, false); err != nil {
 		t.Fatalf("Set user quota: %s", err)
 	}
-	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("gid:%d", gid), GroupQuotaType, map[string]*Quota{fmt.Sprintf("gid:%d", gid): {MaxSpace: 100 << 20, MaxInodes: 100}}, false, false, false); err != nil {
+	if err := m.HandleQuota(ctx, QuotaSet, fmt.Sprintf("gid:%d", gid), GroupQuotaType, map[string]*Quota{fmt.Sprintf("%d", gid): {MaxSpace: 100 << 20, MaxInodes: 100}}, false, false, false); err != nil {
 		t.Fatalf("Set group quota: %s", err)
 	}
 	m.getBase().loadQuotas()
@@ -5077,7 +5077,7 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	if err := m.HandleQuota(ctx, QuotaGet, "", 0, qs, false, false, false); err != nil {
 		t.Fatalf("Get user group quota before batch unlink: %s", err)
 	}
-	ugQuotaBefore := qs[fmt.Sprintf("uid:%d", uid)]
+	ugQuotaBefore := qs[fmt.Sprintf("%d", uid)]
 	if ugQuotaBefore == nil {
 		t.Fatalf("User group quota not found before batch unlink")
 	}
@@ -5111,7 +5111,7 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	if err := m.HandleQuota(ctx, QuotaGet, "", 0, qs, false, false, false); err != nil {
 		t.Fatalf("Get user group quota after batch unlink: %s", err)
 	}
-	ugQuotaAfter := qs[fmt.Sprintf("uid:%d", uid)]
+	ugQuotaAfter := qs[fmt.Sprintf("%d", uid)]
 	if ugQuotaAfter == nil {
 		t.Fatalf("User group quota not found after batch unlink")
 	}
@@ -5163,7 +5163,7 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	if err := m.HandleQuota(ctx, QuotaGet, "", 0, qs, false, false, false); err != nil {
 		t.Fatalf("Get user group quota before hardlink unlink: %s", err)
 	}
-	ugQuotaBeforeHardlink := qs[fmt.Sprintf("uid:%d", uid)]
+	ugQuotaBeforeHardlink := qs[fmt.Sprintf("%d", uid)]
 	if ugQuotaBeforeHardlink == nil {
 		t.Fatalf("User group quota not found before hardlink unlink")
 	}
@@ -5208,7 +5208,7 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	if err := m.HandleQuota(ctx, QuotaGet, "", 0, qs, false, false, false); err != nil {
 		t.Fatalf("Get user group quota after hardlink unlink: %s", err)
 	}
-	ugQuotaAfterHardlink := qs[fmt.Sprintf("uid:%d", uid)]
+	ugQuotaAfterHardlink := qs[fmt.Sprintf("%d", uid)]
 	if ugQuotaAfterHardlink == nil {
 		t.Fatalf("User group quota not found after hardlink unlink")
 	}
@@ -5271,7 +5271,7 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	if err := m.HandleQuota(ctx, QuotaGet, "", 0, qs, false, false, false); err != nil {
 		t.Fatalf("Get user group quota before multi-hardlink batch unlink: %s", err)
 	}
-	ugQuotaBeforeMultiHardlink := qs[fmt.Sprintf("uid:%d", uid)]
+	ugQuotaBeforeMultiHardlink := qs[fmt.Sprintf("%d", uid)]
 	if ugQuotaBeforeMultiHardlink == nil {
 		t.Fatalf("User group quota not found before multi-hardlink batch unlink")
 	}
@@ -5315,7 +5315,7 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	if err := m.HandleQuota(ctx, QuotaGet, "", 0, qs, false, false, false); err != nil {
 		t.Fatalf("Get user group quota after multi-hardlink batch unlink: %s", err)
 	}
-	ugQuotaAfterMultiHardlink := qs[fmt.Sprintf("uid:%d", uid)]
+	ugQuotaAfterMultiHardlink := qs[fmt.Sprintf("%d", uid)]
 	if ugQuotaAfterMultiHardlink == nil {
 		t.Fatalf("User group quota not found after multi-hardlink batch unlink")
 	}
@@ -5386,7 +5386,7 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	if err := m.HandleQuota(ctx, QuotaGet, "", 0, qs, false, false, false); err != nil {
 		t.Fatalf("Get user group quota before symlink batch unlink: %s", err)
 	}
-	ugQuotaBeforeSymlink := qs[fmt.Sprintf("uid:%d", uid)]
+	ugQuotaBeforeSymlink := qs[fmt.Sprintf("%d", uid)]
 	if ugQuotaBeforeSymlink == nil {
 		t.Fatalf("User group quota not found before symlink batch unlink")
 	}
@@ -5420,7 +5420,7 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	if err := m.HandleQuota(ctx, QuotaGet, "", 0, qs, false, false, false); err != nil {
 		t.Fatalf("Get user group quota after symlink batch unlink: %s", err)
 	}
-	ugQuotaAfterSymlink := qs[fmt.Sprintf("uid:%d", uid)]
+	ugQuotaAfterSymlink := qs[fmt.Sprintf("%d", uid)]
 	if ugQuotaAfterSymlink == nil {
 		t.Fatalf("User group quota not found after symlink batch unlink")
 	}
