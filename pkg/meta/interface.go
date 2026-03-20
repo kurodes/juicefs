@@ -90,6 +90,7 @@ const (
 	SetAttrAtimeNow
 	SetAttrMtimeNow
 	SetAttrCtimeNow
+	SetAttrTier
 	SetAttrFlag = 1 << 15
 )
 
@@ -173,12 +174,39 @@ type Attr struct {
 
 	AccessACL  uint32 // access ACL id (identical ACL rules share the same access ACL ID.)
 	DefaultACL uint32 // default ACL id (default ACL and the access ACL share the same cache and store)
+
+	Tier TierInfo // storage tier of the file
+}
+
+type TierInfo uint8
+
+const (
+	tierMask  uint8 = 0xC0 // bits 7~6: tier field
+	valueMask uint8 = 0x03 // tier value mask: 0~3
+	tierShift uint8 = 6
+)
+
+func (tier *TierInfo) SetTierID(t uint8) error {
+	if t > valueMask {
+		return fmt.Errorf("storage tier out of range: %d (want 0~3)", t)
+	}
+	v := uint8(*tier)
+	v = (v &^ tierMask) | ((t & valueMask) << tierShift)
+	*tier = TierInfo(v)
+	return nil
+}
+
+func (tier TierInfo) GetTierID() uint8 {
+	return (uint8(tier) & tierMask) >> tierShift
 }
 
 func (attr *Attr) Marshal() []byte {
 	size := uint32(36 + 24 + 4 + 8)
 	if attr.AccessACL|attr.DefaultACL != aclAPI.None {
 		size += 8
+	}
+	if attr.Tier != 0 {
+		size += 1
 	}
 	w := utils.NewBuffer(size)
 	w.Put8(attr.Flags)
@@ -198,6 +226,9 @@ func (attr *Attr) Marshal() []byte {
 	if attr.AccessACL+attr.DefaultACL > 0 {
 		w.Put32(attr.AccessACL)
 		w.Put32(attr.DefaultACL)
+	}
+	if attr.Tier != 0 {
+		w.Put8(uint8(attr.Tier))
 	}
 	logger.Tracef("attr: %+v -> %+v", attr, w.Bytes())
 	return w.Bytes()
@@ -230,6 +261,9 @@ func (attr *Attr) Unmarshal(buf []byte) {
 	if rb.Left() >= 8 {
 		attr.AccessACL = rb.Get32()
 		attr.DefaultACL = rb.Get32()
+	}
+	if rb.Left() >= 1 {
+		attr.Tier = TierInfo(rb.Get8())
 	}
 	logger.Tracef("attr: %+v -> %+v", buf, attr)
 }

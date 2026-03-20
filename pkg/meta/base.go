@@ -36,6 +36,7 @@ import (
 	"time"
 
 	aclAPI "github.com/juicedata/juicefs/pkg/acl"
+	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
 	"github.com/pkg/errors"
@@ -693,6 +694,10 @@ func (m *baseMeta) Load(checkVersion bool) (*Format, error) {
 			return nil, fmt.Errorf("check version: %s", err)
 		}
 	}
+	if format.Tier == nil {
+		format.Tier = make(map[uint8]object.Tier)
+	}
+	format.Tier[0] = object.Tier{}
 	m.Lock()
 	m.fmt = format
 	m.Unlock()
@@ -3470,6 +3475,10 @@ func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr
 	}
 	if set&SetAttrFlag != 0 {
 		dirtyAttr.Flags = attr.Flags
+		changed = true
+	}
+	if set&SetAttrTier != 0 {
+		dirtyAttr.Tier = attr.Tier
 		changed = true
 	}
 	if !changed {
