@@ -574,11 +574,6 @@ func (m *baseMeta) HandleQuota(ctx Context, cmd uint8, qkey string, qtype uint32
 	var dpath string
 	var key uint64
 
-	if cmd == QuotaList && qkey == "" {
-		return m.handleQuotaList(ctx, qtype, key, quotas, true)
-	}
-
-	// For directory quota, resolve the path to get inode
 	if qtype == DirQuotaType && cmd != QuotaList {
 		dpath = qkey
 		if st := m.resolve(ctx, dpath, &inode, create); st != 0 {
@@ -595,7 +590,7 @@ func (m *baseMeta) HandleQuota(ctx Context, cmd uint8, qkey string, qtype uint32
 		}
 		key = id
 	} else {
-		return fmt.Errorf("invalid quota type")
+		return fmt.Errorf("invalid quota type: %d", qtype)
 	}
 
 	switch cmd {
@@ -606,7 +601,7 @@ func (m *baseMeta) HandleQuota(ctx Context, cmd uint8, qkey string, qtype uint32
 	case QuotaDel:
 		return m.en.doDelQuota(ctx, qtype, key)
 	case QuotaList:
-		return m.handleQuotaList(ctx, qtype, key, quotas, false)
+		return m.handleQuotaList(ctx, qtype, key, quotas, qkey == "")
 	case QuotaCheck:
 		return m.handleQuotaCheck(ctx, qtype, key, dpath, strict, repair, quotas)
 	default:
