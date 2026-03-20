@@ -1472,7 +1472,6 @@ func listFiles(dir string) ([]os.DirEntry, error) {
 	return out, nil
 }
 
-// 从 chunks 目录随机拿一个文件（不做全量遍历）
 func pickOneChunkFile(chunksRoot string) (string, error) {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	// level1: chunks/*
@@ -1481,7 +1480,6 @@ func pickOneChunkFile(chunksRoot string) (string, error) {
 		return "", errors.New("no level1 dirs under chunks")
 	}
 
-	// 随机尝试若干次
 	for t := 0; t < 16; t++ {
 		d1 := l1[r.Intn(len(l1))]
 		p1 := filepath.Join(chunksRoot, d1.Name())
@@ -1513,6 +1511,6 @@ func randomOneFileFromDiskIter(chunksRoot string) func(func(string) bool) {
 		if err != nil {
 			return
 		}
-		_ = yield(f) // 只 yield 一次
+		_ = yield(f)
 	}
 }
