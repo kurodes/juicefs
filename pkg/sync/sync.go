@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"maps"
 	"math"
 	"net/http"
 	"os"
@@ -1631,12 +1632,12 @@ func matchLeveledPath(rules []rule, key string) bool {
 	return true
 }
 
-func listCommonPrefix(store object.ObjectStorage, prefix string, cp chan object.Object, followLink bool) (chan object.Object, error) {
+func listCommonPrefix(store object.ObjectStorage, prefix string, cp chan object.Object, followLink bool, startAfter string) (chan object.Object, error) {
 	var total []object.Object
 	var objs []object.Object
 	var err error
 	var nextToken string
-	var marker string
+	marker := startAfter
 	var hasMore bool
 	var thisListMaxResults int64 = maxResults
 	if strings.HasPrefix(store.String(), "file://") || strings.HasPrefix(store.String(), "nfs://") ||
@@ -1766,17 +1767,47 @@ func produceSingleObject(tasks chan<- object.Object, src, dst object.ObjectStora
 	return err
 }
 
-func startProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, prefix string, listDepth int, config *Config, checkpointMgr *CheckpointManager, checkpoint *Checkpoint) error {
-	if checkpoint != nil {
-		checkpoint.RLock()
-		if state, exists := checkpoint.PrefixState[prefix]; exists && state.ListDone {
-			logger.Debugf("Skipping completed prefix: %s", prefix)
-			checkpoint.RUnlock()
-			return nil
+func restoreFromCheckpoint(tasks chan<- object.Object, src, dst object.ObjectStorage, config *Config, checkpointMgr *CheckpointManager, checkpoint *Checkpoint) error {
+	logger.Infof("Restoring %d prefix states from checkpoint", len(checkpoint.PrefixState))
+
+	var incompletePrefixes []string
+	for prefix, state := range checkpoint.PrefixState {
+		state.Lock()
+		maps.Copy(state.PendingKeys, state.FailedKeys)
+		state.FailedKeys = make(map[string]object.Object)
+
+		var restoreObjs []object.Object
+		for key, obj := range state.PendingKeys {
+			checkpointMgr.TrackKey(key, prefix)
+			restoreObjs = append(restoreObjs, obj)
 		}
-		checkpoint.RUnlock()
+		done := state.ListDone
+		state.Unlock()
+
+		for _, obj := range restoreObjs {
+			incrTotal(1)
+			tasks <- obj
+		}
+
+		if !done {
+			incompletePrefixes = append(incompletePrefixes, prefix)
+		}
 	}
 
+	for _, prefix := range incompletePrefixes {
+		checkpoint.RLock()
+		depth := checkpoint.PrefixState[prefix].ListDepth
+		checkpoint.RUnlock()
+
+		logger.Infof("Restarting producer for incomplete prefix %q (depth=%d)", prefix, depth)
+		if err := startProducer(tasks, src, dst, prefix, depth, config, checkpointMgr, checkpoint); err != nil {
+			logger.Errorf("Failed to restart producer for prefix %s: %v", prefix, err)
+		}
+	}
+	return nil
+}
+
+func startProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, prefix string, listDepth int, config *Config, checkpointMgr *CheckpointManager, checkpoint *Checkpoint) error {
 	config.concurrentList <- 1
 	defer func() {
 		<-config.concurrentList
@@ -1839,7 +1870,16 @@ func startProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, pr
 		}
 	}()
 
-	srckeys, err := listCommonPrefix(src, prefix, commonPrefix, !config.Links)
+	var startAfter string
+	if checkpoint != nil {
+		checkpoint.RLock()
+		if state, exists := checkpoint.PrefixState[prefix]; exists {
+			startAfter = state.LastListedKey
+		}
+		checkpoint.RUnlock()
+	}
+
+	srckeys, err := listCommonPrefix(src, prefix, commonPrefix, !config.Links, startAfter)
 	if err == utils.ENOTSUP {
 		return startSingleProducer(tasks, src, dst, prefix, config, checkpointMgr, checkpoint)
 	} else if err != nil {
@@ -1855,7 +1895,7 @@ func startProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, pr
 		close(t)
 		dstkeys = t
 	} else {
-		dstkeys, err = listCommonPrefix(dst, prefix, dcp, !config.Links)
+		dstkeys, err = listCommonPrefix(dst, prefix, dcp, !config.Links, startAfter)
 		if err == utils.ENOTSUP {
 			return startSingleProducer(tasks, src, dst, prefix, config, checkpointMgr, checkpoint)
 		} else if err != nil {
@@ -2119,33 +2159,10 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		}
 		config.concurrentList = make(chan int, config.ListThreads)
 
-		if checkpoint != nil {
-			logger.Infof("Restoring %d prefix states from checkpoint", len(checkpoint.PrefixState))
-			for prefix, state := range checkpoint.PrefixState {
-				state.Lock()
-				for key, obj := range state.FailedKeys {
-					state.PendingKeys[key] = obj
-				}
-				state.FailedKeys = make(map[string]object.Object)
-
-				// Collect objects to restore (don't send while holding lock)
-				var restoreObjs []object.Object
-				for key, obj := range state.PendingKeys {
-					checkpointMgr.TrackKey(key, prefix)
-					restoreObjs = append(restoreObjs, obj)
-				}
-				state.Unlock()
-
-				// Send to channel without holding the lock
-				for _, obj := range restoreObjs {
-					incrTotal(1)
-					tasks <- obj
-				}
-			}
-		}
-
 		var err error
-		if config.FilesFrom != "" {
+		if checkpoint != nil {
+			err = restoreFromCheckpoint(tasks, src, dst, config, checkpointMgr, checkpoint)
+		} else if config.FilesFrom != "" {
 			err = produceFromList(tasks, src, dst, config, checkpointMgr, checkpoint)
 		} else {
 			err = startProducer(tasks, src, dst, "", config.ListDepth, config, checkpointMgr, checkpoint)
