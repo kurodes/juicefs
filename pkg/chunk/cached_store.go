@@ -1023,7 +1023,7 @@ func (store *cachedStore) shouldCache(size int) bool {
 
 // from key and stagingPath
 func parseObjTier(key string) uint8 {
-	ss := strings.Split(key, "|")
+	ss := strings.Split(key, tierSeparator)
 	if len(ss) == 1 {
 		return 0
 	}
@@ -1031,7 +1031,7 @@ func parseObjTier(key string) uint8 {
 }
 
 func removeObjTier(key string) string {
-	ss := strings.Split(key, "|")
+	ss := strings.Split(key, tierSeparator)
 	return ss[0]
 }
 

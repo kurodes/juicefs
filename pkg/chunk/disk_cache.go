@@ -707,10 +707,12 @@ func (cache *cacheStore) cachePath(key string) string {
 	return filepath.Join(cache.dir, cacheDir, key)
 }
 
+const tierSeparator = "#"
+
 func (cache *cacheStore) stagePath(key string, tierID uint8) string {
 	var tierStr string
 	if tierID != 0 {
-		tierStr = "|" + cast.ToString(tierID)
+		tierStr = tierSeparator + cast.ToString(tierID)
 	}
 	return filepath.Join(cache.dir, stagingDir, key+tierStr)
 }

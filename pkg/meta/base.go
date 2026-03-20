@@ -1994,13 +1994,17 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 
 	*slices = buildSlice(ss)
 	m.of.CacheChunk(inode, indx, *slices)
-	var attr Attr
-	if f == nil {
+	var tierID uint8
+	if f != nil {
+		tierID = f.attr.Tier.GetTierID()
+	} else {
+		var attr Attr
 		if st = m.en.doGetAttr(ctx, inode, &attr); st != 0 {
 			return st
 		}
+		tierID = attr.Tier.GetTierID()
 	}
-	ctx = ctx.WithValue(object.TierKey, attr.Tier.GetTierID())
+	ctx = ctx.WithValue(object.TierKey, tierID)
 	if !m.conf.ReadOnly && (len(ss) >= 5 || len(*slices) >= 5) {
 		go m.compactChunk(ctx, inode, indx, false, false)
 	}
@@ -2052,11 +2056,8 @@ func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice 
 	st := m.en.doWrite(ctx, inode, indx, off, slice, mtime, &numSlices, &delta, &attr)
 	if st == 0 {
 		m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
-		if delta.space != 0 {
-			m.updateUserGroupQuota(ctx, attr.Uid, attr.Gid, delta.space, 0)
-		}
-		ctx = ctx.WithValue(object.TierKey, attr.Tier.GetTierID())
 		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
+		ctx = ctx.WithValue(object.TierKey, attr.Tier.GetTierID())
 		if numSlices%100 == 99 || numSlices > 350 {
 			if numSlices < maxSlices {
 				go m.compactChunk(ctx, inode, indx, false, false)
@@ -2633,14 +2634,15 @@ func (m *baseMeta) CompactAll(ctx Context, threads int, bar *utils.Bar) syscall.
 			for c := range ch {
 				var tierID uint8
 				var attr Attr
+				ctx2 := Background()
 				if eno := m.GetAttr(ctx, c.inode, &attr); eno == 0 {
 					tierID = attr.Tier.GetTierID()
-					ctx = ctx.WithValue(object.TierKey, tierID)
+					ctx2 = ctx2.WithValue(object.TierKey, tierID)
 				} else {
 					logger.Warnf("GetAttr for inode %d: %s", c.inode, eno)
 				}
 				logger.Debugf("Compacting chunk %d:%d (%d slices)", c.inode, c.indx, c.slices)
-				m.compactChunk(ctx, c.inode, c.indx, false, true)
+				m.compactChunk(ctx2, c.inode, c.indx, false, true)
 				bar.Increment()
 			}
 			wg.Done()

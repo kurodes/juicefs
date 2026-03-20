@@ -421,7 +421,11 @@ func cloneTierIdx(src TierIdx) TierIdx {
 type tierInfo atomic.Value
 
 func (t *tierInfo) GetSc(id uint8) (string, bool) {
-	m := (*atomic.Value)(t).Load().(TierIdx)
+	v := (*atomic.Value)(t).Load()
+	if v == nil {
+		return "", false
+	}
+	m := v.(TierIdx)
 	return m.GetSc(id)
 }
 

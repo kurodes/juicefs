@@ -112,7 +112,7 @@ type ObjectStorage interface {
 	CompleteUpload(ctx context.Context, key string, uploadID string, parts []*Part) error
 	// ListUploads lists existing multipart uploads.
 	ListUploads(ctx context.Context, marker string) ([]*PendingPart, string, error)
-
+	// Restore restores an archived object to be available for read.
 	Restore(ctx context.Context, key string) error
 }
 

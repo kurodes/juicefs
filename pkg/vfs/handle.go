@@ -400,6 +400,7 @@ func (v *VFS) loadAllHandles(path string) error {
 			locks:      s.UseLocks,
 			flockOwner: s.FlockOwner,
 			off:        s.Off,
+			tierID:     s.TierID,
 		}
 		h.cond = utils.NewCond(h)
 		v.handles[h.inode] = append(v.handles[h.inode], h)
