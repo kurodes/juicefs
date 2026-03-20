@@ -25,6 +25,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/vfs"
+	"github.com/spf13/cast"
 	"github.com/urfave/cli/v2"
 )
 
@@ -99,8 +100,9 @@ func listTier(ctx *cli.Context) error {
 	for id, t := range format.Tier {
 		results = append(results, []string{fmt.Sprintf("%d", id), t.GetHumanSc()})
 	}
-	sort.Slice(results, func(i, j int) bool {
-		return results[i][0] < results[j][0]
+	dataRows := results[1:]
+	sort.Slice(dataRows, func(i, j int) bool {
+		return cast.ToUint8(dataRows[i][0]) < cast.ToUint8(dataRows[j][0])
 	})
 	printResult(results, 1, false)
 	return nil
@@ -111,6 +113,10 @@ func setTier(ctx *cli.Context) error {
 	setup(ctx, 2)
 	removePassword(ctx.Args().Get(0))
 	path := ctx.Args().Get(1)
+	if !ctx.IsSet("id") {
+		logger.Errorf("missing required flag: -id")
+		logger.Exit(1)
+	}
 	id := ctx.Uint("id")
 	m := meta.NewClient(ctx.Args().Get(0), nil)
 	format, err := m.Load(true)
@@ -259,12 +265,15 @@ func getObjKeys(m meta.Meta, format *meta.Format, ino meta.Ino, length uint64) [
 	var objs []string
 	for index := uint64(0); index*meta.ChunkSize < length; index++ {
 		var cs []meta.Slice
-		_ = m.Read(meta.Background(), ino, uint32(index), &cs)
-		for _, c := range cs {
-			for _, o := range vfs.CalcObjects(*format, c.Id, c.Size, c.Off, c.Len) {
-				k := strings.TrimPrefix(o.Key, format.Name+"/")
-				objs = append(objs, k)
+		if eno := m.Read(meta.Background(), ino, uint32(index), &cs); eno == 0 {
+			for _, c := range cs {
+				for _, o := range vfs.CalcObjects(*format, c.Id, c.Size, c.Off, c.Len) {
+					k := strings.TrimPrefix(o.Key, format.Name+"/")
+					objs = append(objs, k)
+				}
 			}
+		} else {
+			logger.Errorf("read chunk %d of ino %d failed: %s", index, ino, eno)
 		}
 	}
 	return objs
@@ -276,7 +285,7 @@ func visitEntry(m meta.Meta, format *meta.Format, objectFunc func(key string) er
 		for _, obj := range objs {
 			err := objectFunc(obj)
 			if err != nil {
-				logger.Errorf("copy %s: %s", obj, err)
+				logger.Errorf("apply objectFunc failed %s: %s", obj, err)
 				return err
 			}
 		}
