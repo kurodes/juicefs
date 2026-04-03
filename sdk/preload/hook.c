@@ -207,7 +207,10 @@ static int hook(long syscall_number,
         break;
     }
     case SYS_faccessat:
-    case SYS_faccessat2: {
+#ifdef SYS_faccessat2
+    case SYS_faccessat2:
+#endif
+    {
         if ((int)arg0 != AT_FDCWD)
             return 1;
         char *path = (char *)arg1;
@@ -295,7 +298,9 @@ static int hook(long syscall_number,
         break;
 
     case SYS_faccessat:
+#ifdef SYS_faccessat2
     case SYS_faccessat2:
+#endif
         *result = jfs_hook_access(strip_prefix((char *)arg1), (int)arg2);
         break;
 
