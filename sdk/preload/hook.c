@@ -511,7 +511,10 @@ void jfs_preload_register_hook(void) {
 
     /* Register the syscall hook */
     intercept_hook_point = hook;
-    fprintf(stderr, "[juicefs-preload] hook registered, mount_point=%s\n", mount_point);
+    const char *log_level = getenv("JFS_LOG_LEVEL");
+    if (log_level != NULL && strcmp(log_level, "debug") == 0) {
+        fprintf(stderr, "[juicefs-preload] hook registered, mount_point=%s\n", mount_point);
+    }
 }
 
 static __attribute__((constructor)) void init(void) {
