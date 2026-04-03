@@ -62,6 +62,12 @@ extern int jfs_hook_truncate(char *path, long length);
 extern int jfs_hook_utimens(char *path, long atime_sec, long atime_nsec, long mtime_sec, long mtime_nsec);
 extern int jfs_hook_statfs(char *path, struct statvfs *stbuf);
 extern int jfs_hook_getdents64(int fd, void *buf, int count);
+extern int jfs_hook_fd_path(int fd, char *buf, int bufsiz);
+
+/* Check if FD is in our virtual range */
+static inline int is_our_fd(int fd) {
+    return fd >= FD_START;
+}
 
 /* Check if a path is under our mount point */
 static inline int is_our_path(const char *path) {
@@ -80,9 +86,60 @@ static inline char *strip_prefix(const char *path) {
     return (char *)rel; /* already starts with '/' */
 }
 
-/* Check if FD is in our virtual range */
-static inline int is_our_fd(int fd) {
-    return fd >= FD_START;
+/*
+ * Resolve a *at(dirfd, relative_name) into a full JuiceFS path.
+ * If dirfd is AT_FDCWD and path is absolute under mount_point, strip prefix.
+ * If dirfd is a virtual FD, look up its path and join with the relative name.
+ * Returns the JuiceFS-internal path in 'out', or NULL if not our path.
+ */
+static char *resolve_at(int dirfd, const char *pathname, char *out, int outsz) {
+    if (pathname && pathname[0] == '/') {
+        /* Absolute path — ignore dirfd */
+        if (!is_our_path(pathname)) return NULL;
+        return strip_prefix(pathname);
+    }
+    /* Relative path — need dirfd */
+    if (dirfd == AT_FDCWD) return NULL; /* relative to cwd, not ours */
+    if (!is_our_fd(dirfd)) return NULL;
+
+    char dirpath[4096];
+    int dlen = jfs_hook_fd_path(dirfd, dirpath, sizeof(dirpath));
+    if (dlen < 0) return NULL;
+
+    if (pathname == NULL || pathname[0] == '\0') {
+        /* e.g. fstatat(fd, "", ..., AT_EMPTY_PATH) */
+        memcpy(out, dirpath, dlen);
+        out[dlen] = '\0';
+        return out;
+    }
+
+    /* Join dirpath + "/" + pathname */
+    int plen = strlen(pathname);
+    if (dlen + 1 + plen >= outsz) return NULL;
+    memcpy(out, dirpath, dlen);
+    if (dlen > 1 || dirpath[0] != '/') {
+        out[dlen] = '/';
+        memcpy(out + dlen + 1, pathname, plen);
+        out[dlen + 1 + plen] = '\0';
+    } else {
+        /* dirpath is "/" — avoid double slash */
+        memcpy(out + 1, pathname, plen);
+        out[1 + plen] = '\0';
+    }
+    return out;
+}
+
+/*
+ * Helper: resolve a single *at(dirfd, path) argument.
+ * Writes the resolved JuiceFS-internal path into 'out'.
+ * Returns a pointer to the resolved path, or NULL if not ours.
+ */
+static char *resolve_one(int dirfd, const char *pathname, char *out, int outsz) {
+    if (pathname && pathname[0] == '/') {
+        if (!is_our_path(pathname)) return NULL;
+        return strip_prefix(pathname);
+    }
+    return resolve_at(dirfd, pathname, out, outsz);
 }
 
 static int hook(long syscall_number,
@@ -92,396 +149,245 @@ static int hook(long syscall_number,
 {
     if (!initialized) return 1;
 
-    switch (syscall_number) {
-
-    /* ===== Path-based syscalls: filter by mount point prefix ===== */
-
-    case SYS_rename: {
-        char *old_path = (char *)arg0;
-        char *new_path = (char *)arg1;
-        if (!is_our_path(old_path) || !is_our_path(new_path))
-            return 1;
-        break;
-    }
-    case SYS_renameat:
-    case SYS_renameat2: {
-        /* Only support AT_FDCWD for now */
-        if ((int)arg0 != AT_FDCWD || (int)arg2 != AT_FDCWD)
-            return 1;
-        char *old_path = (char *)arg1;
-        char *new_path = (char *)arg3;
-        if (!is_our_path(old_path) || !is_our_path(new_path))
-            return 1;
-        break;
-    }
-    case SYS_link: {
-        char *old_path = (char *)arg0;
-        char *new_path = (char *)arg1;
-        if (!is_our_path(old_path) || !is_our_path(new_path))
-            return 1;
-        break;
-    }
-    case SYS_symlink: {
-        /* target can be anything, but linkpath must be ours */
-        char *linkpath = (char *)arg1;
-        if (!is_our_path(linkpath))
-            return 1;
-        break;
-    }
-    case SYS_mkdir:
-    case SYS_access:
-    case SYS_stat:
-    case SYS_lstat:
-    case SYS_rmdir:
-    case SYS_unlink:
-    case SYS_statfs:
-    case SYS_chmod:
-    case SYS_readlink:
-    case SYS_truncate:
-    case SYS_open: {
-        char *path = (char *)arg0;
-        if (!is_our_path(path))
-            return 1;
-        break;
-    }
-    case SYS_creat: {
-        char *path = (char *)arg0;
-        if (!is_our_path(path))
-            return 1;
-        break;
-    }
-    case SYS_chown:
-    case SYS_lchown: {
-        char *path = (char *)arg0;
-        if (!is_our_path(path))
-            return 1;
-        break;
-    }
-    case SYS_openat: {
-        /* Support AT_FDCWD + absolute path, or absolute path with any dirfd */
-        char *path = (char *)arg1;
-        if ((int)arg0 != AT_FDCWD && path[0] != '/')
-            return 1;
-        if (!is_our_path(path))
-            return 1;
-        break;
-    }
-    case SYS_mkdirat: {
-        if ((int)arg0 != AT_FDCWD)
-            return 1;
-        char *path = (char *)arg1;
-        if (!is_our_path(path))
-            return 1;
-        break;
-    }
-    case SYS_unlinkat: {
-        if ((int)arg0 != AT_FDCWD)
-            return 1;
-        char *path = (char *)arg1;
-        if (!is_our_path(path))
-            return 1;
-        break;
-    }
-    case SYS_fchmodat: {
-        if ((int)arg0 != AT_FDCWD)
-            return 1;
-        char *path = (char *)arg1;
-        if (!is_our_path(path))
-            return 1;
-        break;
-    }
-    case SYS_fchownat: {
-        if ((int)arg0 != AT_FDCWD)
-            return 1;
-        char *path = (char *)arg1;
-        if (!is_our_path(path))
-            return 1;
-        break;
-    }
-    case SYS_newfstatat: {
-        if ((int)arg0 != AT_FDCWD)
-            return 1;
-        char *path = (char *)arg1;
-        if (!is_our_path(path))
-            return 1;
-        break;
-    }
-    case SYS_faccessat:
-#ifdef SYS_faccessat2
-    case SYS_faccessat2:
-#endif
-    {
-        if ((int)arg0 != AT_FDCWD)
-            return 1;
-        char *path = (char *)arg1;
-        if (!is_our_path(path))
-            return 1;
-        break;
-    }
-    case SYS_utimensat: {
-        if ((int)arg0 != AT_FDCWD)
-            return 1;
-        char *path = (char *)arg1;
-        if (path == NULL) return 1; /* fd-based utimensat */
-        if (!is_our_path(path))
-            return 1;
-        break;
-    }
-    case SYS_readlinkat: {
-        if ((int)arg0 != AT_FDCWD)
-            return 1;
-        char *path = (char *)arg1;
-        if (!is_our_path(path))
-            return 1;
-        break;
-    }
-    case SYS_linkat: {
-        if ((int)arg0 != AT_FDCWD || (int)arg2 != AT_FDCWD)
-            return 1;
-        char *old_path = (char *)arg1;
-        char *new_path = (char *)arg3;
-        if (!is_our_path(old_path) || !is_our_path(new_path))
-            return 1;
-        break;
-    }
-    case SYS_symlinkat: {
-        if ((int)arg1 != AT_FDCWD)
-            return 1;
-        char *linkpath = (char *)arg2;
-        if (!is_our_path(linkpath))
-            return 1;
-        break;
-    }
-
-    /* ===== FD-based syscalls: filter by virtual FD range ===== */
-
-    case SYS_lseek:
-    case SYS_read:
-    case SYS_write:
-    case SYS_fsync:
-    case SYS_fdatasync:
-    case SYS_close:
-    case SYS_fstat:
-    case SYS_ftruncate: {
-        int fd = (int)arg0;
-        if (!is_our_fd(fd))
-            return 1;
-        break;
-    }
-    case SYS_getdents64: {
-        int fd = (int)arg0;
-        if (!is_our_fd(fd))
-            return 1;
-        break;
-    }
-
-    default:
-        return 1;
-    }
-
-    /* ===== Dispatch intercepted syscalls to Go functions ===== */
+    char resolved1[4096], resolved2[4096];
+    char *p1, *p2;
 
     switch (syscall_number) {
 
-    /* --- Metadata operations --- */
+    /* ===== Legacy path-based syscalls (no dirfd) ===== */
 
     case SYS_mkdir:
+        if (!is_our_path((char *)arg0)) return 1;
         *result = jfs_hook_mkdir(strip_prefix((char *)arg0), (unsigned int)arg1);
-        break;
-
-    case SYS_mkdirat:
-        *result = jfs_hook_mkdir(strip_prefix((char *)arg1), (unsigned int)arg2);
-        break;
+        return 0;
 
     case SYS_access:
+        if (!is_our_path((char *)arg0)) return 1;
         *result = jfs_hook_access(strip_prefix((char *)arg0), (int)arg1);
-        break;
-
-    case SYS_faccessat:
-#ifdef SYS_faccessat2
-    case SYS_faccessat2:
-#endif
-        *result = jfs_hook_access(strip_prefix((char *)arg1), (int)arg2);
-        break;
+        return 0;
 
     case SYS_stat:
+        if (!is_our_path((char *)arg0)) return 1;
         *result = jfs_hook_stat(strip_prefix((char *)arg0), (struct stat *)arg1);
-        break;
+        return 0;
 
     case SYS_lstat:
+        if (!is_our_path((char *)arg0)) return 1;
         *result = jfs_hook_lstat(strip_prefix((char *)arg0), (struct stat *)arg1);
-        break;
-
-    case SYS_newfstatat: {
-        int flags = (int)arg3;
-        if (flags & AT_SYMLINK_NOFOLLOW)
-            *result = jfs_hook_lstat(strip_prefix((char *)arg1), (struct stat *)arg2);
-        else
-            *result = jfs_hook_stat(strip_prefix((char *)arg1), (struct stat *)arg2);
-        break;
-    }
+        return 0;
 
     case SYS_rmdir:
+        if (!is_our_path((char *)arg0)) return 1;
         *result = jfs_hook_rmdir(strip_prefix((char *)arg0));
-        break;
+        return 0;
 
     case SYS_unlink:
+        if (!is_our_path((char *)arg0)) return 1;
         *result = jfs_hook_unlink(strip_prefix((char *)arg0));
-        break;
+        return 0;
 
-    case SYS_unlinkat: {
-        int flags = (int)arg2;
-        if (flags & AT_REMOVEDIR)
-            *result = jfs_hook_rmdir(strip_prefix((char *)arg1));
-        else
-            *result = jfs_hook_unlink(strip_prefix((char *)arg1));
-        break;
-    }
-
-    case SYS_rename:
-        *result = jfs_hook_rename(strip_prefix((char *)arg0), strip_prefix((char *)arg1));
-        break;
-
-    case SYS_renameat:
-    case SYS_renameat2:
-        *result = jfs_hook_rename(strip_prefix((char *)arg1), strip_prefix((char *)arg3));
-        break;
-
-    case SYS_link:
-        *result = jfs_hook_link(strip_prefix((char *)arg0), strip_prefix((char *)arg1));
-        break;
-
-    case SYS_linkat:
-        *result = jfs_hook_link(strip_prefix((char *)arg1), strip_prefix((char *)arg3));
-        break;
-
-    case SYS_symlink:
-        *result = jfs_hook_symlink((char *)arg0, strip_prefix((char *)arg1));
-        break;
-
-    case SYS_symlinkat:
-        *result = jfs_hook_symlink((char *)arg0, strip_prefix((char *)arg2));
-        break;
-
-    case SYS_readlink:
-        *result = jfs_hook_readlink(strip_prefix((char *)arg0), (char *)arg1, (int)arg2);
-        break;
-
-    case SYS_readlinkat:
-        *result = jfs_hook_readlink(strip_prefix((char *)arg1), (char *)arg2, (int)arg3);
-        break;
+    case SYS_statfs:
+        if (!is_our_path((char *)arg0)) return 1;
+        *result = jfs_hook_statfs(strip_prefix((char *)arg0), (struct statvfs *)arg1);
+        return 0;
 
     case SYS_chmod:
+        if (!is_our_path((char *)arg0)) return 1;
         *result = jfs_hook_chmod(strip_prefix((char *)arg0), (unsigned int)arg1);
-        break;
+        return 0;
 
-    case SYS_fchmodat:
-        *result = jfs_hook_chmod(strip_prefix((char *)arg1), (unsigned int)arg2);
-        break;
+    case SYS_readlink:
+        if (!is_our_path((char *)arg0)) return 1;
+        *result = jfs_hook_readlink(strip_prefix((char *)arg0), (char *)arg1, (int)arg2);
+        return 0;
+
+    case SYS_truncate:
+        if (!is_our_path((char *)arg0)) return 1;
+        *result = jfs_hook_truncate(strip_prefix((char *)arg0), (long)arg1);
+        return 0;
 
     case SYS_chown:
     case SYS_lchown:
+        if (!is_our_path((char *)arg0)) return 1;
         *result = jfs_hook_chown(strip_prefix((char *)arg0), (unsigned int)arg1, (unsigned int)arg2);
-        break;
-
-    case SYS_fchownat:
-        *result = jfs_hook_chown(strip_prefix((char *)arg1), (unsigned int)arg2, (unsigned int)arg3);
-        break;
-
-    case SYS_truncate:
-        *result = jfs_hook_truncate(strip_prefix((char *)arg0), (long)arg1);
-        break;
-
-    case SYS_statfs:
-        *result = jfs_hook_statfs(strip_prefix((char *)arg0), (struct statvfs *)arg1);
-        break;
-
-    case SYS_utimensat: {
-        char *path = strip_prefix((char *)arg1);
-        struct timespec *times = (struct timespec *)arg2;
-        if (times != NULL) {
-            *result = jfs_hook_utimens(path,
-                times[0].tv_sec, times[0].tv_nsec,
-                times[1].tv_sec, times[1].tv_nsec);
-        } else {
-            /* NULL means set to current time */
-            struct timespec now;
-            clock_gettime(CLOCK_REALTIME, &now);
-            *result = jfs_hook_utimens(path,
-                now.tv_sec, now.tv_nsec,
-                now.tv_sec, now.tv_nsec);
-        }
-        break;
-    }
-
-    /* --- File operations --- */
+        return 0;
 
     case SYS_open: {
+        if (!is_our_path((char *)arg0)) return 1;
         char *path = strip_prefix((char *)arg0);
         int flags = (int)arg1;
-        unsigned int mode = (unsigned int)arg2;
-        if (flags & (O_CREAT | O_TRUNC)) {
-            *result = jfs_hook_open(path, flags, mode);
-        } else {
-            *result = jfs_hook_open(path, flags, 0);
-        }
-        break;
-    }
-
-    case SYS_openat: {
-        char *path = strip_prefix((char *)arg1);
-        int flags = (int)arg2;
-        unsigned int mode = (unsigned int)arg3;
-        if (flags & (O_CREAT | O_TRUNC)) {
-            *result = jfs_hook_open(path, flags, mode);
-        } else {
-            *result = jfs_hook_open(path, flags, 0);
-        }
-        break;
+        *result = jfs_hook_open(path, flags, (unsigned int)arg2);
+        return 0;
     }
 
     case SYS_creat:
+        if (!is_our_path((char *)arg0)) return 1;
         *result = jfs_hook_create(strip_prefix((char *)arg0), (unsigned int)arg1);
-        break;
+        return 0;
+
+    case SYS_rename:
+        if (!is_our_path((char *)arg0) || !is_our_path((char *)arg1)) return 1;
+        *result = jfs_hook_rename(strip_prefix((char *)arg0), strip_prefix((char *)arg1));
+        return 0;
+
+    case SYS_link:
+        if (!is_our_path((char *)arg0) || !is_our_path((char *)arg1)) return 1;
+        *result = jfs_hook_link(strip_prefix((char *)arg0), strip_prefix((char *)arg1));
+        return 0;
+
+    case SYS_symlink:
+        if (!is_our_path((char *)arg1)) return 1;
+        *result = jfs_hook_symlink((char *)arg0, strip_prefix((char *)arg1));
+        return 0;
+
+    /* ===== *at syscalls: support both AT_FDCWD and virtual dirfd ===== */
+
+    case SYS_openat: {
+        p1 = resolve_one((int)arg0, (char *)arg1, resolved1, sizeof(resolved1));
+        if (!p1) return 1;
+        int flags = (int)arg2;
+        *result = jfs_hook_open(p1, flags, (unsigned int)arg3);
+        return 0;
+    }
+
+    case SYS_mkdirat:
+        p1 = resolve_one((int)arg0, (char *)arg1, resolved1, sizeof(resolved1));
+        if (!p1) return 1;
+        *result = jfs_hook_mkdir(p1, (unsigned int)arg2);
+        return 0;
+
+    case SYS_unlinkat:
+        p1 = resolve_one((int)arg0, (char *)arg1, resolved1, sizeof(resolved1));
+        if (!p1) return 1;
+        if ((int)arg2 & AT_REMOVEDIR)
+            *result = jfs_hook_rmdir(p1);
+        else
+            *result = jfs_hook_unlink(p1);
+        return 0;
+
+    case SYS_newfstatat:
+        p1 = resolve_one((int)arg0, (char *)arg1, resolved1, sizeof(resolved1));
+        if (!p1) return 1;
+        if ((int)arg3 & AT_SYMLINK_NOFOLLOW)
+            *result = jfs_hook_lstat(p1, (struct stat *)arg2);
+        else
+            *result = jfs_hook_stat(p1, (struct stat *)arg2);
+        return 0;
+
+    case SYS_fchmodat:
+        p1 = resolve_one((int)arg0, (char *)arg1, resolved1, sizeof(resolved1));
+        if (!p1) return 1;
+        *result = jfs_hook_chmod(p1, (unsigned int)arg2);
+        return 0;
+
+    case SYS_fchownat:
+        p1 = resolve_one((int)arg0, (char *)arg1, resolved1, sizeof(resolved1));
+        if (!p1) return 1;
+        *result = jfs_hook_chown(p1, (unsigned int)arg2, (unsigned int)arg3);
+        return 0;
+
+    case SYS_faccessat:
+#ifdef SYS_faccessat2
+    case SYS_faccessat2:
+#endif
+        p1 = resolve_one((int)arg0, (char *)arg1, resolved1, sizeof(resolved1));
+        if (!p1) return 1;
+        *result = jfs_hook_access(p1, (int)arg2);
+        return 0;
+
+    case SYS_readlinkat:
+        p1 = resolve_one((int)arg0, (char *)arg1, resolved1, sizeof(resolved1));
+        if (!p1) return 1;
+        *result = jfs_hook_readlink(p1, (char *)arg2, (int)arg3);
+        return 0;
+
+    case SYS_utimensat: {
+        char *pathname = (char *)arg1;
+        if (pathname == NULL) return 1;
+        p1 = resolve_one((int)arg0, pathname, resolved1, sizeof(resolved1));
+        if (!p1) return 1;
+        struct timespec *times = (struct timespec *)arg2;
+        if (times != NULL) {
+            *result = jfs_hook_utimens(p1,
+                times[0].tv_sec, times[0].tv_nsec,
+                times[1].tv_sec, times[1].tv_nsec);
+        } else {
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            *result = jfs_hook_utimens(p1,
+                now.tv_sec, now.tv_nsec,
+                now.tv_sec, now.tv_nsec);
+        }
+        return 0;
+    }
+
+    case SYS_renameat:
+    case SYS_renameat2:
+        p1 = resolve_one((int)arg0, (char *)arg1, resolved1, sizeof(resolved1));
+        p2 = resolve_one((int)arg2, (char *)arg3, resolved2, sizeof(resolved2));
+        if (!p1 || !p2) return 1;
+        *result = jfs_hook_rename(p1, p2);
+        return 0;
+
+    case SYS_linkat:
+        p1 = resolve_one((int)arg0, (char *)arg1, resolved1, sizeof(resolved1));
+        p2 = resolve_one((int)arg2, (char *)arg3, resolved2, sizeof(resolved2));
+        if (!p1 || !p2) return 1;
+        *result = jfs_hook_link(p1, p2);
+        return 0;
+
+    case SYS_symlinkat:
+        p1 = resolve_one((int)arg1, (char *)arg2, resolved1, sizeof(resolved1));
+        if (!p1) return 1;
+        *result = jfs_hook_symlink((char *)arg0, p1);
+        return 0;
+
+    /* ===== FD-based syscalls: filter by virtual FD range ===== */
 
     case SYS_close:
+        if (!is_our_fd((int)arg0)) return 1;
         *result = jfs_hook_close((int)arg0);
-        break;
+        return 0;
 
     case SYS_read:
+        if (!is_our_fd((int)arg0)) return 1;
         *result = jfs_hook_read((int)arg0, (void *)arg1, (long)arg2);
-        break;
+        return 0;
 
     case SYS_write:
+        if (!is_our_fd((int)arg0)) return 1;
         *result = jfs_hook_write((int)arg0, (void *)arg1, (long)arg2);
-        break;
+        return 0;
 
     case SYS_lseek:
+        if (!is_our_fd((int)arg0)) return 1;
         *result = jfs_hook_lseek((int)arg0, (long)arg1, (int)arg2);
-        break;
+        return 0;
 
     case SYS_fsync:
     case SYS_fdatasync:
+        if (!is_our_fd((int)arg0)) return 1;
         *result = jfs_hook_fsync((int)arg0);
-        break;
+        return 0;
 
     case SYS_fstat:
+        if (!is_our_fd((int)arg0)) return 1;
         *result = jfs_hook_fstat((int)arg0, (struct stat *)arg1);
-        break;
+        return 0;
 
     case SYS_ftruncate:
+        if (!is_our_fd((int)arg0)) return 1;
         *result = jfs_hook_ftruncate((int)arg0, (long)arg1);
-        break;
+        return 0;
 
     case SYS_getdents64:
+        if (!is_our_fd((int)arg0)) return 1;
         *result = jfs_hook_getdents64((int)arg0, (void *)arg1, (int)arg2);
-        break;
+        return 0;
 
     default:
         return 1;
     }
-
-    return 0; /* handled */
 }
 
 static int init_done = 0;

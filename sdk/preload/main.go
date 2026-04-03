@@ -64,10 +64,11 @@ var (
 	metaClient meta.Meta
 
 	// FD table: maps virtual FD -> *fs.File
-	fdLock  sync.Mutex
-	fdTable = make(map[C.int]*fs.File)
-	nextFD  = C.int(fdStart)
-	freeFDs []C.int // recycled FDs
+	fdLock   sync.Mutex
+	fdTable  = make(map[C.int]*fs.File)
+	fdPaths  = make(map[C.int]string) // virtual FD -> JuiceFS path (for *at syscalls)
+	nextFD   = C.int(fdStart)
+	freeFDs  []C.int // recycled FDs
 
 	// mount point prefix (set from JFS_MOUNT_POINT env var)
 	mountPoint string
@@ -80,7 +81,7 @@ func getCtx() meta.Context {
 	return meta.NewContext(pid, uid, []uint32{gid})
 }
 
-func allocFD(f *fs.File) C.int {
+func allocFD(f *fs.File, path string) C.int {
 	fdLock.Lock()
 	defer fdLock.Unlock()
 	var fd C.int
@@ -92,6 +93,7 @@ func allocFD(f *fs.File) C.int {
 		nextFD++
 	}
 	fdTable[fd] = f
+	fdPaths[fd] = path
 	return fd
 }
 
@@ -107,6 +109,7 @@ func freeFD(fd C.int) *fs.File {
 	f := fdTable[fd]
 	if f != nil {
 		delete(fdTable, fd)
+		delete(fdPaths, fd)
 		freeFDs = append(freeFDs, fd)
 	}
 	return f
@@ -268,7 +271,7 @@ func jfs_hook_open(cpath *C.char, flags C.int, mode C.uint) C.int {
 	if eno != 0 {
 		return negErrno(eno)
 	}
-	return allocFD(f)
+	return allocFD(f, path)
 }
 
 //export jfs_hook_create
@@ -280,7 +283,24 @@ func jfs_hook_create(cpath *C.char, mode C.uint) C.int {
 	if eno != 0 {
 		return negErrno(eno)
 	}
-	return allocFD(f)
+	return allocFD(f, path)
+}
+
+//export jfs_hook_fd_path
+func jfs_hook_fd_path(fd C.int, cbuf *C.char, bufsiz C.int) C.int {
+	fdLock.Lock()
+	p, ok := fdPaths[fd]
+	fdLock.Unlock()
+	if !ok {
+		return -1
+	}
+	if len(p) >= int(bufsiz) {
+		return -1
+	}
+	buf := unsafe.Slice((*byte)(unsafe.Pointer(cbuf)), int(bufsiz))
+	copy(buf, p)
+	buf[len(p)] = 0
+	return C.int(len(p))
 }
 
 //export jfs_hook_close
