@@ -269,6 +269,12 @@ func jfs_hook_init() {
 func jfs_hook_open(cpath *C.char, flags C.int, mode C.uint) C.int {
 	path := C.GoString(cpath)
 	f, eno := jfs.Open(getCtx(), path, uint32(flags))
+	if eno == syscall.ENOENT && int(flags)&syscall.O_CREAT != 0 {
+		// File doesn't exist and O_CREAT is set — create it
+		umask := uint16(syscall.Umask(0))
+		syscall.Umask(int(umask))
+		f, eno = jfs.Create(getCtx(), path, uint16(mode), umask)
+	}
 	if eno != 0 {
 		return negErrno(eno)
 	}
