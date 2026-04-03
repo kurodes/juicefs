@@ -484,7 +484,12 @@ static int hook(long syscall_number,
     return 0; /* handled */
 }
 
+static int init_done = 0;
+
 void jfs_preload_register_hook(void) {
+    if (init_done) return;
+    init_done = 1;
+
     /* Read mount point from environment */
     const char *mp = getenv("JFS_MOUNT_POINT");
     if (mp == NULL || mp[0] == '\0') {
