@@ -143,7 +143,32 @@ LD_PRELOAD=/path/to/libjfs_preload.so your_application
 
 6. **`SYS_statx` 需要内核 >= 4.11**：在老内核上编译时 `statx` 支持会被自动跳过（`#ifdef SYS_statx`）。老系统的 glibc 也不会调用 `statx`，因此不影响运行。
 
-7. **`dup`/`dup2`/`fcntl(F_DUPFD)` 未拦截**：复制虚拟 FD 的操作不被支持。
+7. **`dup`/`dup2`/`fcntl(F_DUPFD)` 未拦截**：复制虚拟 FD 的操作不被支持。因此 shell 重定向（`echo "x" > /jfs/file`）不可用，请使用 Python 等应用程序直接进行文件 IO。
+
+## 测试
+
+提供了一个 Python 测试脚本，覆盖 AI 场景中常见的文件系统操作：
+
+```bash
+export JFS_META_URL="postgres://localhost:5432/mypg?sslmode=disable"
+export JFS_MOUNT_POINT=/jfs
+LD_PRELOAD=./libjfs_preload.so python3 test_preload.py
+```
+
+测试用例包括：
+
+| # | 测试项 | 说明 |
+|---|---|---|
+| 1 | 基础目录操作 | makedirs, listdir, exists, isdir |
+| 2 | 文本文件读写 | write, read, append, 内容校验 |
+| 3 | 大文件读写 | 10MB 二进制文件 + MD5 校验 |
+| 4 | 批量小文件 | 100 个 shard 文件创建 + 读取验证 |
+| 5 | 文件元数据 | stat, chmod, utime |
+| 6 | 文件管理 | rename, symlink, readlink, remove |
+| 7 | JSON 配置读写 | json.dump / json.load 往返验证 |
+| 8 | Pickle checkpoint | 模拟 PyTorch checkpoint 序列化/反序列化 |
+| 9 | Seek 随机读取 | seek + read + tell 验证 |
+| 10 | 清理 | shutil.rmtree 递归删除 |
 
 ## 设计参考
 
