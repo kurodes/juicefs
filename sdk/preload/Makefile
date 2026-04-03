@@ -26,7 +26,7 @@ endif
 
 # Build tags: exclude heavy optional backends to minimize binary size.
 # Override with BUILD_TAGS= to include all backends.
-BUILD_TAGS ?= nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd,nocifs,nogspt
+BUILD_TAGS ?= nogateway,nowebdav,nohdfs,nosftp,nonfs,nodragonfly,nocifs,nogspt
 
 OUTPUT := libjfs_preload.so
 
