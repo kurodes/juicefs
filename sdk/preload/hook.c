@@ -62,6 +62,7 @@ extern int jfs_hook_truncate(char *path, long length);
 extern int jfs_hook_utimens(char *path, long atime_sec, long atime_nsec, long mtime_sec, long mtime_nsec);
 extern int jfs_hook_statfs(char *path, struct statvfs *stbuf);
 extern int jfs_hook_getdents64(int fd, void *buf, int count);
+extern int jfs_hook_statx(char *path, int flags, unsigned int mask, void *statxbuf);
 extern int jfs_hook_fd_path(int fd, char *buf, int bufsiz);
 
 /* Check if FD is in our virtual range */
@@ -272,6 +273,12 @@ static int hook(long syscall_number,
             *result = jfs_hook_lstat(p1, (struct stat *)arg2);
         else
             *result = jfs_hook_stat(p1, (struct stat *)arg2);
+        return 0;
+
+    case SYS_statx:
+        p1 = resolve_one((int)arg0, (char *)arg1, resolved1, sizeof(resolved1));
+        if (!p1) return 1;
+        *result = jfs_hook_statx(p1, (int)arg2, (unsigned int)arg3, (void *)arg4);
         return 0;
 
     case SYS_fchmodat:

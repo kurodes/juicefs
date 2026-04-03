@@ -20,6 +20,7 @@ package main
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <linux/stat.h>
 #include <fcntl.h>
 #include <dirent.h>
 #include <unistd.h>
@@ -601,6 +602,43 @@ func fillStat(stbuf *C.struct_stat, fi *fs.FileStat) {
 	stbuf.st_mtim.tv_nsec = C.long(attr.Mtimensec)
 	stbuf.st_ctim.tv_sec = C.long(attr.Ctime)
 	stbuf.st_ctim.tv_nsec = C.long(attr.Ctimensec)
+}
+
+func fillStatx(stbuf *C.struct_statx, fi *fs.FileStat) {
+	attr := fi.Sys().(*meta.Attr)
+	C.memset(unsafe.Pointer(stbuf), 0, C.sizeof_struct_statx)
+	stbuf.stx_mask = C.STATX_BASIC_STATS
+	stbuf.stx_blksize = 4096
+	stbuf.stx_nlink = C.__u32(attr.Nlink)
+	stbuf.stx_uid = C.__u32(attr.Uid)
+	stbuf.stx_gid = C.__u32(attr.Gid)
+	stbuf.stx_mode = C.__u16(attr.SMode())
+	stbuf.stx_ino = C.__u64(fi.Inode())
+	stbuf.stx_size = C.__u64(attr.Length)
+	stbuf.stx_blocks = C.__u64((attr.Length + 511) / 512)
+	stbuf.stx_atime.tv_sec = C.__s64(attr.Atime)
+	stbuf.stx_atime.tv_nsec = C.__u32(attr.Atimensec)
+	stbuf.stx_mtime.tv_sec = C.__s64(attr.Mtime)
+	stbuf.stx_mtime.tv_nsec = C.__u32(attr.Mtimensec)
+	stbuf.stx_ctime.tv_sec = C.__s64(attr.Ctime)
+	stbuf.stx_ctime.tv_nsec = C.__u32(attr.Ctimensec)
+}
+
+//export jfs_hook_statx
+func jfs_hook_statx(cpath *C.char, flags C.int, mask C.uint, stbuf *C.struct_statx) C.int {
+	path := C.GoString(cpath)
+	var fi *fs.FileStat
+	var eno syscall.Errno
+	if int(flags)&C.AT_SYMLINK_NOFOLLOW != 0 {
+		fi, eno = jfs.Lstat(getCtx(), path)
+	} else {
+		fi, eno = jfs.Stat(getCtx(), path)
+	}
+	if eno != 0 {
+		return negErrno(eno)
+	}
+	fillStatx(stbuf, fi)
+	return 0
 }
 
 func init() {
