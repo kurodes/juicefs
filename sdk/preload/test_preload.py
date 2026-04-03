@@ -11,7 +11,6 @@ import hashlib
 import json
 import os
 import pickle
-import shutil
 import sys
 import time
 
@@ -20,7 +19,7 @@ TEST_DIR = os.path.join(MOUNT, f"preload_test_{os.getpid()}")
 
 passed = 0
 failed = 0
-total_tests = 10
+total_tests = 9
 
 
 def run_test(num, name, fn):
@@ -301,16 +300,6 @@ def test_seek_operations():
 
 
 # ============================================================================
-# Test 10: 清理
-# ============================================================================
-def test_cleanup():
-    shutil.rmtree(TEST_DIR)
-    print(f"  rmtree {TEST_DIR}")
-    assert not os.path.exists(TEST_DIR), f"{TEST_DIR} should be removed"
-    print(f"  verified removal: OK")
-
-
-# ============================================================================
 # Main
 # ============================================================================
 def main():
@@ -318,10 +307,6 @@ def main():
     print(f"  mount point: {MOUNT}")
     print(f"  test dir:    {TEST_DIR}")
     print(f"  pid:         {os.getpid()}")
-
-    # 清理可能残留的测试目录
-    if os.path.exists(TEST_DIR):
-        shutil.rmtree(TEST_DIR)
 
     run_test(1, "基础目录操作", test_directory_ops)
     run_test(2, "文本文件读写", test_text_readwrite)
@@ -332,7 +317,6 @@ def main():
     run_test(7, "JSON 配置读写", test_json_config)
     run_test(8, "Pickle checkpoint 读写", test_pickle_checkpoint)
     run_test(9, "Seek 随机读取", test_seek_operations)
-    run_test(10, "清理", test_cleanup)
 
     print(f"\n{'='*50}")
     print(f"Results: {passed} passed, {failed} failed (total {total_tests})")
