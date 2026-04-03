@@ -275,11 +275,13 @@ static int hook(long syscall_number,
             *result = jfs_hook_stat(p1, (struct stat *)arg2);
         return 0;
 
+#ifdef SYS_statx
     case SYS_statx:
         p1 = resolve_one((int)arg0, (char *)arg1, resolved1, sizeof(resolved1));
         if (!p1) return 1;
         *result = jfs_hook_statx(p1, (int)arg2, (unsigned int)arg3, (void *)arg4);
         return 0;
+#endif
 
     case SYS_fchmodat:
         p1 = resolve_one((int)arg0, (char *)arg1, resolved1, sizeof(resolved1));

@@ -607,7 +607,7 @@ func fillStat(stbuf *C.struct_stat, fi *fs.FileStat) {
 func fillStatx(stbuf *C.struct_statx, fi *fs.FileStat) {
 	attr := fi.Sys().(*meta.Attr)
 	C.memset(unsafe.Pointer(stbuf), 0, C.sizeof_struct_statx)
-	stbuf.stx_mask = C.STATX_BASIC_STATS
+	stbuf.stx_mask = C.__u32(C.STATX_BASIC_STATS)
 	stbuf.stx_blksize = 4096
 	stbuf.stx_nlink = C.__u32(attr.Nlink)
 	stbuf.stx_uid = C.__u32(attr.Uid)
