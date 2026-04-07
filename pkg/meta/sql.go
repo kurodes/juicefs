@@ -4633,8 +4633,7 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 		nowNano := time.Now().UnixNano()
 		*result = batchCloneResult{userGroupQuotas: make([]userGroupQuotaDelta, 0, len(entries))}
 
-		pn, err := m.validateCloneTarget(ctx, s, dstParent)
-		if err != nil {
+		if _, err := m.validateCloneTarget(ctx, s, dstParent); err != nil {
 			return err
 		}
 
@@ -4700,7 +4699,9 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 			}
 
 			entrySpace := align4K(sn.Length)
-			result.length += int64(sn.Length)
+			if sn.Type == TypeFile {
+				result.length += int64(sn.Length)
+			}
 			result.space += entrySpace
 			result.inodes++
 			result.userGroupQuotas = append(result.userGroupQuotas, userGroupQuotaDelta{
@@ -4828,14 +4829,6 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 			return err
 		}
 
-		if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
-			pn.setMtime(nowNano)
-			pn.setCtime(nowNano)
-			if _, err := s.Cols("mtime", "ctime", "mtimensec", "ctimensec").
-				Update(&pn, &node{Inode: dstParent}); err != nil {
-				return err
-			}
-		}
 		return nil
 	})
 	if err != nil {
