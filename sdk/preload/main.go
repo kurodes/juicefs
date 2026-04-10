@@ -174,14 +174,16 @@ type preloadConf struct {
 func loadConf() preloadConf {
 	conf := preloadConf{
 		CacheDir:        "jfscache",
-		CacheSize:       "1024",
+		CacheSize:       "100G",
 		AutoCreate:      true,
 		CacheFullBlock:  true,
-		CacheChecksum:   "full",
+		CacheChecksum:   "extend",
 		CacheEviction:   "2-random",
 		MaxUploads:      20,
-		MaxDownloads:    20,
+		MaxDownloads:    200,
 		Prefetch:        1,
+		SkipDirNlink:    20,
+		SkipDirMtime:    "100ms",
 		GetTimeout:      "60s",
 		PutTimeout:      "60s",
 		FastResolve:     true,
@@ -189,7 +191,8 @@ func loadConf() preloadConf {
 		EntryTimeout:    "1s",
 		DirEntryTimeout: "1s",
 		BufferSize:      "300M",
-		BackupMeta:      "0",
+		BackupMeta:      "1h",
+		Heartbeat:       "12s",
 	}
 
 	jsonStr := os.Getenv("JFS_CONFIG")
