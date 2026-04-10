@@ -34,6 +34,7 @@ void jfs_preload_register_hook(void);
 */
 import "C"
 import (
+	"encoding/json"
 	"os"
 	"runtime/debug"
 	"strconv"
@@ -124,27 +125,207 @@ func negErrno(err syscall.Errno) C.int {
 	return C.int(-err)
 }
 
+// preloadConf mirrors libjfs's javaConf for JSON configuration compatibility.
+// Use JFS_CONFIG env var to pass JSON, or individual JFS_* env vars.
+// Individual env vars override JSON fields.
+type preloadConf struct {
+	MetaURL         string `json:"meta"`
+	MountPoint      string `json:"mountPoint"`
+	Bucket          string `json:"bucket"`
+	StorageClass    string `json:"storageClass"`
+	ReadOnly        bool   `json:"readOnly"`
+	NoSession       bool   `json:"noSession"`
+	NoBGJob         bool   `json:"noBGJob"`
+	OpenCache       string `json:"openCache"`
+	BackupMeta      string `json:"backupMeta"`
+	BackupSkipTrash bool   `json:"backupSkipTrash"`
+	Heartbeat       string `json:"heartbeat"`
+	CacheDir        string `json:"cacheDir"`
+	CacheSize       string `json:"cacheSize"`
+	CacheItems      int64  `json:"cacheItems"`
+	FreeSpace       string `json:"freeSpace"`
+	AutoCreate      bool   `json:"autoCreate"`
+	CacheFullBlock  bool   `json:"cacheFullBlock"`
+	CacheChecksum   string `json:"cacheChecksum"`
+	CacheEviction   string `json:"cacheEviction"`
+	Writeback       bool   `json:"writeback"`
+	MemorySize      string `json:"memorySize"`
+	Prefetch        int    `json:"prefetch"`
+	Readahead       string `json:"readahead"`
+	UploadLimit     string `json:"uploadLimit"`
+	DownloadLimit   string `json:"downloadLimit"`
+	MaxUploads      int    `json:"maxUploads"`
+	MaxDownloads    int    `json:"maxDownloads"`
+	SkipDirNlink    int    `json:"skipDirNlink"`
+	SkipDirMtime    string `json:"skipDirMtime"`
+	IORetries       int    `json:"ioRetries"`
+	GetTimeout      string `json:"getTimeout"`
+	PutTimeout      string `json:"putTimeout"`
+	FastResolve     bool   `json:"fastResolve"`
+	AttrTimeout     string `json:"attrTimeout"`
+	EntryTimeout    string `json:"entryTimeout"`
+	DirEntryTimeout string `json:"dirEntryTimeout"`
+	Debug           bool   `json:"debug"`
+	AccessLog       string `json:"accessLog"`
+	Subdir          string `json:"subdir"`
+	LogLevel        string `json:"logLevel"`
+	BufferSize      string `json:"bufferSize"`
+}
+
+func loadConf() preloadConf {
+	// Start with defaults
+	conf := preloadConf{
+		CacheDir:       "jfscache",
+		CacheSize:      "1024",
+		AutoCreate:     true,
+		CacheFullBlock: true,
+		CacheChecksum:  "full",
+		CacheEviction:  "2-random",
+		MaxUploads:     20,
+		MaxDownloads:   20,
+		Prefetch:       1,
+		GetTimeout:     "60s",
+		PutTimeout:     "60s",
+		FastResolve:    true,
+		AttrTimeout:    "1s",
+		EntryTimeout:   "1s",
+		DirEntryTimeout: "1s",
+		BufferSize:     "300M",
+		BackupMeta:     "0",
+	}
+
+	// Parse JFS_CONFIG JSON if provided
+	if jsonStr := os.Getenv("JFS_CONFIG"); jsonStr != "" {
+		if err := json.Unmarshal([]byte(jsonStr), &conf); err != nil {
+			logger.Fatalf("invalid JFS_CONFIG JSON: %s", err)
+		}
+	}
+
+	// Individual env vars override JSON fields
+	if v := os.Getenv("JFS_META_URL"); v != "" {
+		conf.MetaURL = v
+	}
+	if v := os.Getenv("JFS_MOUNT_POINT"); v != "" {
+		conf.MountPoint = v
+	}
+	if v := os.Getenv("JFS_CACHE_DIR"); v != "" {
+		conf.CacheDir = v
+	}
+	if v := os.Getenv("JFS_CACHE_SIZE"); v != "" {
+		conf.CacheSize = v
+	}
+	if v := os.Getenv("JFS_BUFFER_SIZE"); v != "" {
+		conf.BufferSize = v
+	}
+	if os.Getenv("JFS_READ_ONLY") != "" {
+		conf.ReadOnly = true
+	}
+	if os.Getenv("JFS_NO_BGJOB") != "" {
+		conf.NoBGJob = true
+	}
+	if os.Getenv("JFS_NO_SESSION") != "" {
+		conf.NoSession = true
+	}
+	if os.Getenv("JFS_WRITEBACK") != "" {
+		conf.Writeback = true
+	}
+	if v := os.Getenv("JFS_BACKUP_META"); v != "" {
+		conf.BackupMeta = v
+	}
+	if v := os.Getenv("JFS_OPEN_CACHE"); v != "" {
+		conf.OpenCache = v
+	}
+	if v := os.Getenv("JFS_HEARTBEAT"); v != "" {
+		conf.Heartbeat = v
+	}
+	if v := os.Getenv("JFS_SKIP_DIR_MTIME"); v != "" {
+		conf.SkipDirMtime = v
+	}
+	if v := os.Getenv("JFS_SKIP_DIR_NLINK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			conf.SkipDirNlink = n
+		}
+	}
+	if v := os.Getenv("JFS_IO_RETRIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			conf.IORetries = n
+		}
+	}
+	if v := os.Getenv("JFS_MAX_UPLOADS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			conf.MaxUploads = n
+		}
+	}
+	if v := os.Getenv("JFS_MAX_DOWNLOADS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			conf.MaxDownloads = n
+		}
+	}
+	if v := os.Getenv("JFS_PREFETCH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			conf.Prefetch = n
+		}
+	}
+	if v := os.Getenv("JFS_UPLOAD_LIMIT"); v != "" {
+		conf.UploadLimit = v
+	}
+	if v := os.Getenv("JFS_DOWNLOAD_LIMIT"); v != "" {
+		conf.DownloadLimit = v
+	}
+	if v := os.Getenv("JFS_ATTR_TIMEOUT"); v != "" {
+		conf.AttrTimeout = v
+	}
+	if v := os.Getenv("JFS_ENTRY_TIMEOUT"); v != "" {
+		conf.EntryTimeout = v
+	}
+	if v := os.Getenv("JFS_DIR_ENTRY_TIMEOUT"); v != "" {
+		conf.DirEntryTimeout = v
+	}
+	if v := os.Getenv("JFS_GET_TIMEOUT"); v != "" {
+		conf.GetTimeout = v
+	}
+	if v := os.Getenv("JFS_PUT_TIMEOUT"); v != "" {
+		conf.PutTimeout = v
+	}
+	if v := os.Getenv("JFS_READAHEAD"); v != "" {
+		conf.Readahead = v
+	}
+	if v := os.Getenv("JFS_ACCESS_LOG"); v != "" {
+		conf.AccessLog = v
+	}
+	if v := os.Getenv("JFS_SUBDIR"); v != "" {
+		conf.Subdir = v
+	}
+	if v := os.Getenv("JFS_LOG_LEVEL"); v != "" {
+		conf.LogLevel = v
+	}
+	if os.Getenv("JUICEFS_DEBUG") != "" || os.Getenv("JFS_DEBUG") != "" {
+		conf.Debug = true
+	}
+
+	return conf
+}
+
 func initJFS() {
 	jfsOnce.Do(func() {
 		debug.SetGCPercent(50)
 		object.UserAgent = "JuiceFS-Preload " + version.Version()
 
-		metaURL := os.Getenv("JFS_META_URL")
-		if metaURL == "" {
-			logger.Fatalf("JFS_META_URL environment variable is required")
+		c := loadConf()
+
+		if c.MetaURL == "" {
+			logger.Fatalf("meta URL is required (set JFS_META_URL or 'meta' in JFS_CONFIG)")
 		}
-		mountPoint = os.Getenv("JFS_MOUNT_POINT")
-		if mountPoint == "" {
-			logger.Fatalf("JFS_MOUNT_POINT environment variable is required")
+		if c.MountPoint == "" {
+			logger.Fatalf("mount point is required (set JFS_MOUNT_POINT or 'mountPoint' in JFS_CONFIG)")
 		}
-		// Ensure mount point ends without trailing slash for consistent prefix matching
-		mountPoint = strings.TrimRight(mountPoint, "/")
+		mountPoint = strings.TrimRight(c.MountPoint, "/")
 
 		// Log level
-		if os.Getenv("JUICEFS_DEBUG") != "" {
+		if c.Debug {
 			utils.SetLogLevel(logrus.DebugLevel)
-		} else if lvl := os.Getenv("JFS_LOG_LEVEL"); lvl != "" {
-			level, err := logrus.ParseLevel(lvl)
+		} else if c.LogLevel != "" {
+			level, err := logrus.ParseLevel(c.LogLevel)
 			if err == nil {
 				utils.SetLogLevel(level)
 			} else {
@@ -156,70 +337,74 @@ func initJFS() {
 
 		// Metadata config
 		metaConf := meta.DefaultConf()
-		if v := os.Getenv("JFS_IO_RETRIES"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				metaConf.Retries = n
-			}
+		metaConf.ReadOnly = c.ReadOnly
+		metaConf.NoBGJob = c.NoBGJob || c.NoSession
+		if c.IORetries > 0 {
+			metaConf.Retries = c.IORetries
 		}
-		if os.Getenv("JFS_READ_ONLY") != "" {
-			metaConf.ReadOnly = true
+		if c.OpenCache != "" {
+			metaConf.OpenCache = utils.Duration(c.OpenCache)
 		}
-		if v := os.Getenv("JFS_OPEN_CACHE"); v != "" {
-			metaConf.OpenCache = utils.Duration(v)
+		if c.SkipDirMtime != "" {
+			metaConf.SkipDirMtime = utils.Duration(c.SkipDirMtime)
 		}
-		if os.Getenv("JFS_NO_BGJOB") != "" {
-			metaConf.NoBGJob = true
-		}
-		if v := os.Getenv("JFS_SKIP_DIR_MTIME"); v != "" {
-			metaConf.SkipDirMtime = utils.Duration(v)
-		}
-		if v := os.Getenv("JFS_SKIP_DIR_NLINK"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				metaConf.SkipDirNlink = n
-			}
-		}
-		if v := os.Getenv("JFS_HEARTBEAT"); v != "" {
-			metaConf.Heartbeat = utils.Duration(v)
+		metaConf.SkipDirNlink = c.SkipDirNlink
+		if c.Heartbeat != "" {
+			metaConf.Heartbeat = utils.Duration(c.Heartbeat)
 		}
 
-		m := meta.NewClient(metaURL, metaConf)
+		m := meta.NewClient(c.MetaURL, metaConf)
 		metaClient = m
 		format, err := m.Load(true)
 		if err != nil {
 			logger.Fatalf("load setting: %s", err)
 		}
 
-		blob, err := cmd.NewReloadableStorage(format, m, nil)
+		blob, err := cmd.NewReloadableStorage(format, m, func(f *meta.Format) {
+			if c.Bucket != "" {
+				f.Bucket = c.Bucket
+			}
+			if c.StorageClass != "" {
+				f.StorageClass = c.StorageClass
+			}
+		})
 		if err != nil {
 			logger.Fatalf("object storage: %s", err)
 		}
 		logger.Infof("Data use %s", blob)
 
 		// Chunk config
-		var freeSpaceRatio float64 = 0.1
+		var freeSpaceRatio = 0.1
+		if c.FreeSpace != "" {
+			freeSpaceRatio, _ = strconv.ParseFloat(c.FreeSpace, 64)
+		}
 		chunkConf := chunk.Config{
 			BlockSize:      format.BlockSize * 1024,
 			Compress:       format.Compression,
-			CacheDir:       getEnvDefault("JFS_CACHE_DIR", "jfscache"),
+			CacheDir:       c.CacheDir,
 			CacheMode:      0644,
-			CacheSize:      parseCacheSize(),
+			CacheSize:      utils.ParseBytesStr("cache-size", c.CacheSize, 'M'),
+			CacheItems:     c.CacheItems,
 			FreeSpace:      float32(freeSpaceRatio),
-			AutoCreate:     true,
-			CacheFullBlock: true,
-			CacheChecksum:  getEnvDefault("JFS_CACHE_CHECKSUM", "full"),
-			CacheEviction:  getEnvDefault("JFS_CACHE_EVICTION", "2-random"),
-			MaxUpload:      getEnvInt("JFS_MAX_UPLOADS", 20),
-			MaxDownload:    getEnvInt("JFS_MAX_DOWNLOADS", 20),
+			AutoCreate:     c.AutoCreate,
+			CacheFullBlock: c.CacheFullBlock,
+			CacheChecksum:  c.CacheChecksum,
+			CacheEviction:  c.CacheEviction,
+			MaxUpload:      c.MaxUploads,
+			MaxDownload:    c.MaxDownloads,
 			MaxRetries:     10,
-			Prefetch:       getEnvInt("JFS_PREFETCH", 1),
-			BufferSize:     parseByteSize("JFS_BUFFER_SIZE", 300<<20),
-			Readahead:      int(parseByteSize("JFS_MAX_READAHEAD", 0)),
+			Prefetch:       c.Prefetch,
+			BufferSize:     utils.ParseBytesStr("buffer-size", c.BufferSize, 'M'),
+			Readahead:      int(utils.ParseBytesStr("readahead", c.Readahead, 'M')),
 			HashPrefix:     format.HashPrefix,
-			GetTimeout:     utils.Duration(getEnvDefault("JFS_GET_TIMEOUT", "60s")),
-			PutTimeout:     utils.Duration(getEnvDefault("JFS_PUT_TIMEOUT", "60s")),
-			Writeback:      os.Getenv("JFS_WRITEBACK") != "",
-			UploadLimit:    parseRate("JFS_UPLOAD_LIMIT"),
-			DownloadLimit:  parseRate("JFS_DOWNLOAD_LIMIT"),
+			GetTimeout:     utils.Duration(c.GetTimeout),
+			PutTimeout:     utils.Duration(c.PutTimeout),
+			Writeback:      c.Writeback,
+			UploadLimit:    int64(utils.ParseMbpsStr("upload-limit", c.UploadLimit) * 1e6 / 8),
+			DownloadLimit:  int64(utils.ParseMbpsStr("download-limit", c.DownloadLimit) * 1e6 / 8),
+		}
+		if c.IORetries > 0 {
+			chunkConf.MaxRetries = c.IORetries
 		}
 		chunkConf.SelfCheck(format.UUID)
 		store := chunk.NewCachedStore(blob, chunkConf, nil)
@@ -233,8 +418,7 @@ func initJFS() {
 			id := args[1].(uint64)
 			return vfs.Compact(chunkConf, store, slices, id)
 		})
-		noSession := os.Getenv("JFS_NO_SESSION") != ""
-		if err := m.NewSession(!noSession); err != nil {
+		if err := m.NewSession(!c.NoSession); err != nil {
 			logger.Fatalf("new session: %s", err)
 		}
 		m.OnReload(func(fmt *meta.Format) {
@@ -242,72 +426,33 @@ func initJFS() {
 		})
 
 		// VFS config
-		backupMeta := utils.Duration(getEnvDefault("JFS_BACKUP_META", "0"))
+		backupMeta := utils.Duration(c.BackupMeta)
 		conf := &vfs.Config{
 			Meta:            metaConf,
 			Format:          *format,
 			Chunk:           &chunkConf,
-			AttrTimeout:     utils.Duration(getEnvDefault("JFS_ATTR_TIMEOUT", "1s")),
-			EntryTimeout:    utils.Duration(getEnvDefault("JFS_ENTRY_TIMEOUT", "1s")),
-			DirEntryTimeout: utils.Duration(getEnvDefault("JFS_DIR_ENTRY_TIMEOUT", "1s")),
-			FastResolve:     true,
+			AttrTimeout:     utils.Duration(c.AttrTimeout),
+			EntryTimeout:    utils.Duration(c.EntryTimeout),
+			DirEntryTimeout: utils.Duration(c.DirEntryTimeout),
+			FastResolve:     c.FastResolve,
+			AccessLog:       c.AccessLog,
+			Subdir:          c.Subdir,
 			BackupMeta:      backupMeta,
+			BackupSkipTrash: c.BackupSkipTrash,
 		}
 
-		if !metaConf.ReadOnly && !noSession && !metaConf.NoBGJob && backupMeta > 0 {
-			go vfs.Backup(m, blob, backupMeta, false)
+		if !metaConf.ReadOnly && !c.NoSession && !metaConf.NoBGJob && backupMeta > 0 {
+			go vfs.Backup(m, blob, backupMeta, c.BackupSkipTrash)
 		}
 
 		jfs, err = fs.NewFileSystem(conf, m, store, nil)
 		if err != nil {
 			logger.Fatalf("initialize filesystem: %s", err)
 		}
-		logger.Infof("JuiceFS preload initialized: meta=%s mount=%s", metaURL, mountPoint)
+		logger.Infof("JuiceFS preload initialized: meta=%s mount=%s", c.MetaURL, mountPoint)
 	})
 }
 
-func getEnvDefault(key, defaultVal string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return defaultVal
-}
-
-func parseCacheSize() uint64 {
-	v := os.Getenv("JFS_CACHE_SIZE")
-	if v == "" {
-		return 1024 << 20 // 1 GiB default
-	}
-	return utils.ParseBytesStr("cache-size", v, 'M')
-}
-
-func getEnvInt(key string, defaultVal int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return defaultVal
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return defaultVal
-	}
-	return n
-}
-
-func parseByteSize(key string, defaultVal uint64) uint64 {
-	v := os.Getenv(key)
-	if v == "" {
-		return defaultVal
-	}
-	return utils.ParseBytesStr(key, v, 'M')
-}
-
-func parseRate(key string) int64 {
-	v := os.Getenv(key)
-	if v == "" {
-		return 0
-	}
-	return int64(utils.ParseMbpsStr(key, v) * 1e6 / 8)
-}
 
 // ============================================================================
 // Exported Go functions called by hook.c

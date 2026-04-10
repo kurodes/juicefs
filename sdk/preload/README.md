@@ -60,6 +60,31 @@ make SYSCALL_INTERCEPT_DIR=/usr/local \
 
 ## 使用
 
+支持两种配置方式：**JSON 配置**（推荐）和**独立环境变量**。独立环境变量会覆盖 JSON 中的同名字段。
+
+### 方式一：JSON 配置（推荐）
+
+```bash
+export JFS_MOUNT_POINT=/jfs
+export JFS_CONFIG='{
+  "meta": "postgres://localhost:5432/mypg?sslmode=disable",
+  "cacheDir": "memory",
+  "cacheSize": "0",
+  "noBGJob": true,
+  "backupMeta": "0",
+  "bufferSize": "800M",
+  "attrTimeout": "1s",
+  "entryTimeout": "1s",
+  "prefetch": 3,
+  "fastResolve": true
+}'
+LD_PRELOAD=./libjfs_preload.so python3 your_app.py
+```
+
+JSON 字段名与 JuiceFS Java SDK 的配置格式完全兼容。
+
+### 方式二：独立环境变量
+
 ```bash
 # 1. 先用 juicefs CLI 格式化卷（只需一次）
 juicefs format redis://localhost:6379/1 myvol
