@@ -167,6 +167,20 @@ func initJFS() {
 		if v := os.Getenv("JFS_OPEN_CACHE"); v != "" {
 			metaConf.OpenCache = utils.Duration(v)
 		}
+		if os.Getenv("JFS_NO_BGJOB") != "" {
+			metaConf.NoBGJob = true
+		}
+		if v := os.Getenv("JFS_SKIP_DIR_MTIME"); v != "" {
+			metaConf.SkipDirMtime = utils.Duration(v)
+		}
+		if v := os.Getenv("JFS_SKIP_DIR_NLINK"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				metaConf.SkipDirNlink = n
+			}
+		}
+		if v := os.Getenv("JFS_HEARTBEAT"); v != "" {
+			metaConf.Heartbeat = utils.Duration(v)
+		}
 
 		m := meta.NewClient(metaURL, metaConf)
 		metaClient = m
@@ -192,17 +206,20 @@ func initJFS() {
 			FreeSpace:      float32(freeSpaceRatio),
 			AutoCreate:     true,
 			CacheFullBlock: true,
-			CacheChecksum:  "full",
-			CacheEviction:  "2-random",
-			MaxUpload:      20,
-			MaxDownload:    20,
+			CacheChecksum:  getEnvDefault("JFS_CACHE_CHECKSUM", "full"),
+			CacheEviction:  getEnvDefault("JFS_CACHE_EVICTION", "2-random"),
+			MaxUpload:      getEnvInt("JFS_MAX_UPLOADS", 20),
+			MaxDownload:    getEnvInt("JFS_MAX_DOWNLOADS", 20),
 			MaxRetries:     10,
-			Prefetch:       1,
-			BufferSize:     300 << 20, // 300 MiB
-			Readahead:      0,
+			Prefetch:       getEnvInt("JFS_PREFETCH", 1),
+			BufferSize:     parseByteSize("JFS_BUFFER_SIZE", 300<<20),
+			Readahead:      int(parseByteSize("JFS_MAX_READAHEAD", 0)),
 			HashPrefix:     format.HashPrefix,
-			GetTimeout:     utils.Duration("60s"),
-			PutTimeout:     utils.Duration("60s"),
+			GetTimeout:     utils.Duration(getEnvDefault("JFS_GET_TIMEOUT", "60s")),
+			PutTimeout:     utils.Duration(getEnvDefault("JFS_PUT_TIMEOUT", "60s")),
+			Writeback:      os.Getenv("JFS_WRITEBACK") != "",
+			UploadLimit:    parseRate("JFS_UPLOAD_LIMIT"),
+			DownloadLimit:  parseRate("JFS_DOWNLOAD_LIMIT"),
 		}
 		chunkConf.SelfCheck(format.UUID)
 		store := chunk.NewCachedStore(blob, chunkConf, nil)
@@ -216,7 +233,8 @@ func initJFS() {
 			id := args[1].(uint64)
 			return vfs.Compact(chunkConf, store, slices, id)
 		})
-		if err := m.NewSession(true); err != nil {
+		noSession := os.Getenv("JFS_NO_SESSION") != ""
+		if err := m.NewSession(!noSession); err != nil {
 			logger.Fatalf("new session: %s", err)
 		}
 		m.OnReload(func(fmt *meta.Format) {
@@ -224,13 +242,20 @@ func initJFS() {
 		})
 
 		// VFS config
+		backupMeta := utils.Duration(getEnvDefault("JFS_BACKUP_META", "0"))
 		conf := &vfs.Config{
-			Meta:         metaConf,
-			Format:       *format,
-			Chunk:        &chunkConf,
-			AttrTimeout:  utils.Duration(getEnvDefault("JFS_ATTR_TIMEOUT", "1s")),
-			EntryTimeout: utils.Duration(getEnvDefault("JFS_ENTRY_TIMEOUT", "1s")),
-			FastResolve:  true,
+			Meta:            metaConf,
+			Format:          *format,
+			Chunk:           &chunkConf,
+			AttrTimeout:     utils.Duration(getEnvDefault("JFS_ATTR_TIMEOUT", "1s")),
+			EntryTimeout:    utils.Duration(getEnvDefault("JFS_ENTRY_TIMEOUT", "1s")),
+			DirEntryTimeout: utils.Duration(getEnvDefault("JFS_DIR_ENTRY_TIMEOUT", "1s")),
+			FastResolve:     true,
+			BackupMeta:      backupMeta,
+		}
+
+		if !metaConf.ReadOnly && !noSession && !metaConf.NoBGJob && backupMeta > 0 {
+			go vfs.Backup(m, blob, backupMeta, false)
 		}
 
 		jfs, err = fs.NewFileSystem(conf, m, store, nil)
@@ -254,6 +279,34 @@ func parseCacheSize() uint64 {
 		return 1024 << 20 // 1 GiB default
 	}
 	return utils.ParseBytesStr("cache-size", v, 'M')
+}
+
+func getEnvInt(key string, defaultVal int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return defaultVal
+	}
+	return n
+}
+
+func parseByteSize(key string, defaultVal uint64) uint64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal
+	}
+	return utils.ParseBytesStr(key, v, 'M')
+}
+
+func parseRate(key string) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0
+	}
+	return int64(utils.ParseMbpsStr(key, v) * 1e6 / 8)
 }
 
 // ============================================================================
