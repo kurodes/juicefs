@@ -125,12 +125,11 @@ func negErrno(err syscall.Errno) C.int {
 	return C.int(-err)
 }
 
-// preloadConf mirrors libjfs's javaConf for JSON configuration compatibility.
-// Use JFS_CONFIG env var to pass JSON, or individual JFS_* env vars.
-// Individual env vars override JSON fields.
+// preloadConf mirrors libjfs's javaConf for JSON configuration.
+// Configure via JFS_CONFIG env var with a JSON object.
+// JFS_MOUNT_POINT env var sets the intercepted path prefix.
 type preloadConf struct {
 	MetaURL         string `json:"meta"`
-	MountPoint      string `json:"mountPoint"`
 	Bucket          string `json:"bucket"`
 	StorageClass    string `json:"storageClass"`
 	ReadOnly        bool   `json:"readOnly"`
@@ -166,141 +165,39 @@ type preloadConf struct {
 	EntryTimeout    string `json:"entryTimeout"`
 	DirEntryTimeout string `json:"dirEntryTimeout"`
 	Debug           bool   `json:"debug"`
+	LogLevel        string `json:"logLevel"`
 	AccessLog       string `json:"accessLog"`
 	Subdir          string `json:"subdir"`
-	LogLevel        string `json:"logLevel"`
 	BufferSize      string `json:"bufferSize"`
 }
 
 func loadConf() preloadConf {
-	// Start with defaults
 	conf := preloadConf{
-		CacheDir:       "jfscache",
-		CacheSize:      "1024",
-		AutoCreate:     true,
-		CacheFullBlock: true,
-		CacheChecksum:  "full",
-		CacheEviction:  "2-random",
-		MaxUploads:     20,
-		MaxDownloads:   20,
-		Prefetch:       1,
-		GetTimeout:     "60s",
-		PutTimeout:     "60s",
-		FastResolve:    true,
-		AttrTimeout:    "1s",
-		EntryTimeout:   "1s",
+		CacheDir:        "jfscache",
+		CacheSize:       "1024",
+		AutoCreate:      true,
+		CacheFullBlock:  true,
+		CacheChecksum:   "full",
+		CacheEviction:   "2-random",
+		MaxUploads:      20,
+		MaxDownloads:    20,
+		Prefetch:        1,
+		GetTimeout:      "60s",
+		PutTimeout:      "60s",
+		FastResolve:     true,
+		AttrTimeout:     "1s",
+		EntryTimeout:    "1s",
 		DirEntryTimeout: "1s",
-		BufferSize:     "300M",
-		BackupMeta:     "0",
+		BufferSize:      "300M",
+		BackupMeta:      "0",
 	}
 
-	// Parse JFS_CONFIG JSON if provided
-	if jsonStr := os.Getenv("JFS_CONFIG"); jsonStr != "" {
-		if err := json.Unmarshal([]byte(jsonStr), &conf); err != nil {
-			logger.Fatalf("invalid JFS_CONFIG JSON: %s", err)
-		}
+	jsonStr := os.Getenv("JFS_CONFIG")
+	if jsonStr == "" {
+		logger.Fatalf("JFS_CONFIG environment variable is required")
 	}
-
-	// Individual env vars override JSON fields
-	if v := os.Getenv("JFS_META_URL"); v != "" {
-		conf.MetaURL = v
-	}
-	if v := os.Getenv("JFS_MOUNT_POINT"); v != "" {
-		conf.MountPoint = v
-	}
-	if v := os.Getenv("JFS_CACHE_DIR"); v != "" {
-		conf.CacheDir = v
-	}
-	if v := os.Getenv("JFS_CACHE_SIZE"); v != "" {
-		conf.CacheSize = v
-	}
-	if v := os.Getenv("JFS_BUFFER_SIZE"); v != "" {
-		conf.BufferSize = v
-	}
-	if os.Getenv("JFS_READ_ONLY") != "" {
-		conf.ReadOnly = true
-	}
-	if os.Getenv("JFS_NO_BGJOB") != "" {
-		conf.NoBGJob = true
-	}
-	if os.Getenv("JFS_NO_SESSION") != "" {
-		conf.NoSession = true
-	}
-	if os.Getenv("JFS_WRITEBACK") != "" {
-		conf.Writeback = true
-	}
-	if v := os.Getenv("JFS_BACKUP_META"); v != "" {
-		conf.BackupMeta = v
-	}
-	if v := os.Getenv("JFS_OPEN_CACHE"); v != "" {
-		conf.OpenCache = v
-	}
-	if v := os.Getenv("JFS_HEARTBEAT"); v != "" {
-		conf.Heartbeat = v
-	}
-	if v := os.Getenv("JFS_SKIP_DIR_MTIME"); v != "" {
-		conf.SkipDirMtime = v
-	}
-	if v := os.Getenv("JFS_SKIP_DIR_NLINK"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			conf.SkipDirNlink = n
-		}
-	}
-	if v := os.Getenv("JFS_IO_RETRIES"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			conf.IORetries = n
-		}
-	}
-	if v := os.Getenv("JFS_MAX_UPLOADS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			conf.MaxUploads = n
-		}
-	}
-	if v := os.Getenv("JFS_MAX_DOWNLOADS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			conf.MaxDownloads = n
-		}
-	}
-	if v := os.Getenv("JFS_PREFETCH"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			conf.Prefetch = n
-		}
-	}
-	if v := os.Getenv("JFS_UPLOAD_LIMIT"); v != "" {
-		conf.UploadLimit = v
-	}
-	if v := os.Getenv("JFS_DOWNLOAD_LIMIT"); v != "" {
-		conf.DownloadLimit = v
-	}
-	if v := os.Getenv("JFS_ATTR_TIMEOUT"); v != "" {
-		conf.AttrTimeout = v
-	}
-	if v := os.Getenv("JFS_ENTRY_TIMEOUT"); v != "" {
-		conf.EntryTimeout = v
-	}
-	if v := os.Getenv("JFS_DIR_ENTRY_TIMEOUT"); v != "" {
-		conf.DirEntryTimeout = v
-	}
-	if v := os.Getenv("JFS_GET_TIMEOUT"); v != "" {
-		conf.GetTimeout = v
-	}
-	if v := os.Getenv("JFS_PUT_TIMEOUT"); v != "" {
-		conf.PutTimeout = v
-	}
-	if v := os.Getenv("JFS_READAHEAD"); v != "" {
-		conf.Readahead = v
-	}
-	if v := os.Getenv("JFS_ACCESS_LOG"); v != "" {
-		conf.AccessLog = v
-	}
-	if v := os.Getenv("JFS_SUBDIR"); v != "" {
-		conf.Subdir = v
-	}
-	if v := os.Getenv("JFS_LOG_LEVEL"); v != "" {
-		conf.LogLevel = v
-	}
-	if os.Getenv("JUICEFS_DEBUG") != "" || os.Getenv("JFS_DEBUG") != "" {
-		conf.Debug = true
+	if err := json.Unmarshal([]byte(jsonStr), &conf); err != nil {
+		logger.Fatalf("invalid JFS_CONFIG JSON: %s", err)
 	}
 
 	return conf
@@ -313,13 +210,15 @@ func initJFS() {
 
 		c := loadConf()
 
+		mountPoint = os.Getenv("JFS_MOUNT_POINT")
+		if mountPoint == "" {
+			logger.Fatalf("JFS_MOUNT_POINT environment variable is required")
+		}
+		mountPoint = strings.TrimRight(mountPoint, "/")
+
 		if c.MetaURL == "" {
-			logger.Fatalf("meta URL is required (set JFS_META_URL or 'meta' in JFS_CONFIG)")
+			logger.Fatalf("\"meta\" field is required in JFS_CONFIG")
 		}
-		if c.MountPoint == "" {
-			logger.Fatalf("mount point is required (set JFS_MOUNT_POINT or 'mountPoint' in JFS_CONFIG)")
-		}
-		mountPoint = strings.TrimRight(c.MountPoint, "/")
 
 		// Log level
 		if c.Debug {

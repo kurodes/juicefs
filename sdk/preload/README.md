@@ -60,11 +60,16 @@ make SYSCALL_INTERCEPT_DIR=/usr/local \
 
 ## 使用
 
-支持两种配置方式：**JSON 配置**（推荐）和**独立环境变量**。独立环境变量会覆盖 JSON 中的同名字段。
+通过两个环境变量配置：
 
-### 方式一：JSON 配置（推荐）
+- `JFS_MOUNT_POINT` — 拦截的路径前缀（必需）
+- `JFS_CONFIG` — JSON 格式的 JuiceFS 配置（必需）
 
 ```bash
+# 1. 先用 juicefs CLI 格式化卷（只需一次）
+juicefs format 'postgres://localhost:5432/mypg?sslmode=disable' myvol
+
+# 2. 配置并运行
 export JFS_MOUNT_POINT=/jfs
 export JFS_CONFIG='{
   "meta": "postgres://localhost:5432/mypg?sslmode=disable",
@@ -81,76 +86,73 @@ export JFS_CONFIG='{
 LD_PRELOAD=./libjfs_preload.so python3 your_app.py
 ```
 
+## JFS_CONFIG 字段说明
+
 JSON 字段名与 JuiceFS Java SDK 的配置格式完全兼容。
 
-### 方式二：独立环境变量
+| 字段 | mount 对应参数 | 类型 | 说明 | 默认值 |
+|---|---|---|---|---|
+| `meta` | 第一个参数 | string | 元数据引擎地址（**必需**） | — |
+| **缓存** | | | | |
+| `cacheDir` | `--cache-dir` | string | 缓存目录（`memory` 表示纯内存） | `jfscache` |
+| `cacheSize` | `--cache-size` | string | 缓存大小（MiB） | `"1024"` |
+| `bufferSize` | `--buffer-size` | string | 读写缓冲区大小 | `"300M"` |
+| `writeback` | `--writeback` | bool | 写回模式 | `false` |
+| `prefetch` | `--prefetch` | int | 预读并发数 | `1` |
+| `readahead` | `--max-readahead` | string | 最大预读大小 | `""` |
+| `cacheFullBlock` | `--cache-full-block` | bool | 缓存完整块 | `true` |
+| `cacheChecksum` | `--verify-cache-checksum` | string | 缓存校验 | `"full"` |
+| `cacheEviction` | `--cache-eviction` | string | 缓存淘汰策略 | `"2-random"` |
+| `freeSpace` | `--free-space-ratio` | string | 可用空间比例 | `"0.1"` |
+| `autoCreate` | `--auto-create-cache-dir` | bool | 自动创建缓存目录 | `true` |
+| **元数据缓存** | | | | |
+| `attrTimeout` | `--attr-cache` | string | 属性缓存超时 | `"1s"` |
+| `entryTimeout` | `--entry-cache` | string | 文件项缓存超时 | `"1s"` |
+| `dirEntryTimeout` | `--dir-entry-cache` | string | 目录项缓存超时 | `"1s"` |
+| `openCache` | `--open-cache` | string | Open 缓存时间 | `""` |
+| **后台任务** | | | | |
+| `noBGJob` | `--no-bgjob` | bool | 禁用后台任务 | `false` |
+| `backupMeta` | `--backup-meta` | string | 自动备份间隔（`"0"` 禁用） | `"0"` |
+| `noSession` | — | bool | 禁用 session 注册 | `false` |
+| **性能调优** | | | | |
+| `skipDirMtime` | `--skip-dir-mtime` | string | 跳过目录 mtime 更新窗口 | `""` |
+| `skipDirNlink` | `--skip-dir-nlink` | int | 跳过目录 nlink 计算 | `0` |
+| `ioRetries` | `--io-retries` | int | IO 重试次数 | `10` |
+| `maxUploads` | `--max-uploads` | int | 最大上传并发 | `20` |
+| `maxDownloads` | `--max-downloads` | int | 最大下载并发 | `20` |
+| `uploadLimit` | `--upload-limit` | string | 上传带宽限制（Mbps） | `""` |
+| `downloadLimit` | `--download-limit` | string | 下载带宽限制（Mbps） | `""` |
+| `getTimeout` | `--get-timeout` | string | 对象存储 GET 超时 | `"60s"` |
+| `putTimeout` | `--put-timeout` | string | 对象存储 PUT 超时 | `"60s"` |
+| **其他** | | | | |
+| `readOnly` | `--read-only` | bool | 只读模式 | `false` |
+| `debug` | — | bool | 开启 debug 日志 | `false` |
+| `logLevel` | — | string | 日志级别 | `"warn"` |
+| `fastResolve` | `--fast-resolve` | bool | 快速路径解析 | `true` |
+| `heartbeat` | `--heartbeat` | string | 客户端心跳间隔 | `""` |
+| `bucket` | `--bucket` | string | 覆盖存储桶地址 | `""` |
+| `storageClass` | `--storage-class` | string | 存储类别 | `""` |
+| `subdir` | `--subdir` | string | 子目录 | `""` |
+| `accessLog` | `--access-log` | string | 访问日志路径 | `""` |
 
-```bash
-# 1. 先用 juicefs CLI 格式化卷（只需一次）
-juicefs format redis://localhost:6379/1 myvol
-
-# 2. 设置环境变量
-export JFS_META_URL=redis://localhost:6379/1
-export JFS_MOUNT_POINT=/jfs
-
-# 3. 用 LD_PRELOAD 方式运行应用
-LD_PRELOAD=/path/to/libjfs_preload.so your_application
-
-# 也可以 export LD_PRELOAD，但注意所有子进程都会加载（见下文"已知限制"）
-```
-
-## 环境变量
-
-| 变量 | mount 对应参数 | 说明 | 默认值 |
-|---|---|---|---|
-| `JFS_META_URL` | 第一个参数 | 元数据引擎地址（**必需**） | — |
-| `JFS_MOUNT_POINT` | 第二个参数 | 拦截的路径前缀（**必需**） | — |
-| **缓存相关** | | | |
-| `JFS_CACHE_DIR` | `--cache-dir` | 本地缓存目录（`memory` 表示纯内存） | `jfscache` |
-| `JFS_CACHE_SIZE` | `--cache-size` | 缓存大小（MiB） | `1024` |
-| `JFS_BUFFER_SIZE` | `--buffer-size` | 读写缓冲区大小 | `300M` |
-| `JFS_WRITEBACK` | `--writeback` | 启用写回模式（设为 `1` 启用） | 禁用 |
-| `JFS_PREFETCH` | `--prefetch` | 预读并发数 | `1` |
-| `JFS_MAX_READAHEAD` | `--max-readahead` | 最大预读大小 | `0` |
-| **元数据缓存** | | | |
-| `JFS_ATTR_TIMEOUT` | `--attr-cache` | 属性缓存超时 | `1s` |
-| `JFS_ENTRY_TIMEOUT` | `--entry-cache` | 文件项缓存超时 | `1s` |
-| `JFS_DIR_ENTRY_TIMEOUT` | `--dir-entry-cache` | 目录项缓存超时 | `1s` |
-| `JFS_OPEN_CACHE` | `--open-cache` | Open 缓存时间 | `0s` |
-| **后台任务** | | | |
-| `JFS_NO_BGJOB` | `--no-bgjob` | 禁用后台任务（设为 `1` 禁用） | 启用 |
-| `JFS_BACKUP_META` | `--backup-meta` | 自动备份元数据间隔（`0` 禁用） | `0` |
-| `JFS_NO_SESSION` | — | 禁用 session 注册 | 启用 |
-| **性能调优** | | | |
-| `JFS_SKIP_DIR_MTIME` | `--skip-dir-mtime` | 跳过目录 mtime 更新的时间窗口 | — |
-| `JFS_SKIP_DIR_NLINK` | `--skip-dir-nlink` | 跳过目录 nlink 计算 | — |
-| `JFS_IO_RETRIES` | `--io-retries` | IO 重试次数 | `10` |
-| `JFS_MAX_UPLOADS` | `--max-uploads` | 最大上传并发 | `20` |
-| `JFS_MAX_DOWNLOADS` | `--max-downloads` | 最大下载并发 | `20` |
-| `JFS_UPLOAD_LIMIT` | `--upload-limit` | 上传带宽限制（Mbps） | `0`(不限) |
-| `JFS_DOWNLOAD_LIMIT` | `--download-limit` | 下载带宽限制（Mbps） | `0`(不限) |
-| `JFS_GET_TIMEOUT` | `--get-timeout` | 对象存储 GET 超时 | `60s` |
-| `JFS_PUT_TIMEOUT` | `--put-timeout` | 对象存储 PUT 超时 | `60s` |
-| **其他** | | | |
-| `JFS_READ_ONLY` | `--read-only` | 只读模式（设为 `1` 启用） | 禁用 |
-| `JFS_LOG_LEVEL` | `--log` (级别部分) | 日志级别 | `warn` |
-| `JFS_HEARTBEAT` | `--heartbeat` | 客户端心跳间隔 | — |
-
-### 与你的 mount 命令对应
+### 与 mount 命令对应示例
 
 ```bash
 # mount 命令:
-# juicefs mount 'postgres://...' /jfs --background \
-#   --backup-meta=0 --no-bgjob=true \
-#   --cache-dir=memory --cache-size=0
+juicefs mount 'postgres://...' /jfs --background \
+  --backup-meta=0 --no-bgjob=true \
+  --cache-dir=memory --cache-size=0 --buffer-size=800M
 
-# 等价的 LD_PRELOAD 环境变量:
-export JFS_META_URL="postgres://localhost:5432/mypg?sslmode=disable"
+# 等价的 LD_PRELOAD 方式:
 export JFS_MOUNT_POINT=/jfs
-export JFS_BACKUP_META=0
-export JFS_NO_BGJOB=1
-export JFS_CACHE_DIR=memory
-export JFS_CACHE_SIZE=0
+export JFS_CONFIG='{
+  "meta": "postgres://localhost:5432/mypg?sslmode=disable",
+  "backupMeta": "0",
+  "noBGJob": true,
+  "cacheDir": "memory",
+  "cacheSize": "0",
+  "bufferSize": "800M"
+}'
 LD_PRELOAD=./libjfs_preload.so python3 your_app.py
 ```
 
