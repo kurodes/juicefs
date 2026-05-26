@@ -20,10 +20,13 @@
 package meta
 
 import (
+	"container/heap"
 	"context"
+	"encoding/binary"
 	"math"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -112,7 +115,7 @@ func newTikvClient(addr string) (tkvClient, error) {
 	}
 
 	prefix := strings.TrimLeft(tUrl.Path, "/")
-	return withPrefix(&tikvClient{client.KVStore, interval}, append([]byte(prefix), 0xFD)), nil
+	return withPrefix(&tikvClient{client: client.KVStore, gcInterval: interval, changeLogShards: tiKVChangeLogShards()}, append([]byte(prefix), 0xFD)), nil
 }
 
 type tikvTxn struct {
@@ -143,6 +146,16 @@ func (tx *tikvTxn) gets(keys ...[]byte) [][]byte {
 }
 
 func (tx *tikvTxn) scan(begin, end []byte, keysOnly bool, handler func(k, v []byte) bool) {
+	it := tx.iter(begin, end, keysOnly)
+	defer it.Close()
+	for it.Valid() && handler(it.Key(), it.Value()) {
+		if err := it.Next(); err != nil {
+			panic(err)
+		}
+	}
+}
+
+func (tx *tikvTxn) iter(begin, end []byte, keysOnly bool) kvIterator {
 	snap := tx.GetSnapshot()
 	snap.SetScanBatchSize(10240)
 	snap.SetNotFillCache(true)
@@ -151,12 +164,7 @@ func (tx *tikvTxn) scan(begin, end []byte, keysOnly bool, handler func(k, v []by
 	if err != nil {
 		panic(err)
 	}
-	defer it.Close()
-	for it.Valid() && handler(it.Key(), it.Value()) {
-		if err = it.Next(); err != nil {
-			panic(err)
-		}
-	}
+	return it
 }
 
 func (tx *tikvTxn) exist(prefix []byte) bool {
@@ -195,9 +203,113 @@ func (tx *tikvTxn) delete(key []byte) {
 	}
 }
 
+func (tx *tikvTxn) id() uint64 {
+	// StartTS is in milliseconds, and the last 18 bits are for logical time,
+	// so we can use it directly as version
+	return tx.StartTS()
+}
+
+const defaultTiKVChangeLogShards = 64
+
+func tiKVChangeLogShards() int {
+	const envName = "JFS_TKV_CHANGELOG_SHARDS"
+	s := os.Getenv(envName)
+	if s == "" {
+		return defaultTiKVChangeLogShards
+	}
+	shards, err := strconv.Atoi(s)
+	if err != nil || shards <= 0 || shards > 256 {
+		logger.Warnf("invalid %s: %s, use %d", envName, s, defaultTiKVChangeLogShards)
+		return defaultTiKVChangeLogShards
+	}
+	return shards
+}
+
+func (c *tikvClient) logKey(m *kvMeta, id uint64) []byte {
+	shard := byte((id ^ (id >> 18)) % uint64(c.changeLogShards))
+	return m.fmtKey("XLOG", shard, id)
+}
+
+func parseTiKVLogID(key []byte) uint64 {
+	return binary.BigEndian.Uint64(key[5:])
+}
+
+type logMergeItem struct {
+	id    uint64
+	shard int
+}
+
+type logMergeHeap struct {
+	items []logMergeItem
+}
+
+func (h *logMergeHeap) Len() int           { return len(h.items) }
+func (h *logMergeHeap) Less(i, j int) bool { return h.items[i].id < h.items[j].id }
+func (h *logMergeHeap) Swap(i, j int)      { h.items[i], h.items[j] = h.items[j], h.items[i] }
+func (h *logMergeHeap) Push(x any)         { h.items = append(h.items, x.(logMergeItem)) }
+func (h *logMergeHeap) Pop() any {
+	n := len(h.items)
+	item := h.items[n-1]
+	h.items = h.items[:n-1]
+	return item
+}
+
+func (c *tikvClient) scanLogRange(m *kvMeta, tx *kvTxn, beginID, endID uint64, keysOnly bool, handler func(id uint64, k, v []byte) bool) {
+	itx := tx.kvtxn.(iterKvTxn)
+	shards := c.changeLogShards
+	iters := make([]kvIterator, shards)
+	for shard := 0; shard < shards; shard++ {
+		iters[shard] = itx.iter(m.fmtKey("XLOG", byte(shard), beginID), m.fmtKey("XLOG", byte(shard), endID), keysOnly)
+		defer iters[shard].Close()
+	}
+
+	h := &logMergeHeap{}
+	for i, it := range iters {
+		if it.Valid() {
+			id := parseTiKVLogID(it.Key())
+			h.items = append(h.items, logMergeItem{id: id, shard: i})
+		}
+	}
+	heap.Init(h)
+
+	for h.Len() > 0 {
+		item := heap.Pop(h).(logMergeItem)
+		it := iters[item.shard]
+		if !handler(item.id, it.Key(), it.Value()) {
+			return
+		}
+		if err := it.Next(); err != nil {
+			panic(err)
+		}
+		if it.Valid() {
+			id := parseTiKVLogID(it.Key())
+			heap.Push(h, logMergeItem{id: id, shard: item.shard})
+		}
+	}
+}
+
+func (c *tikvClient) rewind(id uint64, factor int) uint64 {
+	// TiKV's timestamp is in milliseconds, and the last 18 bits are for logical time,
+	// so we can rewind at most 10 seconds to avoid missing some logs
+	shift := uint64(10 * 1000 * (1 << 18))
+	if s := os.Getenv("JFS_TKV_REWIND"); s != "" {
+		if parsed, err := strconv.ParseUint(s, 10, 64); err == nil && parsed > 0 {
+			shift = parsed
+		}
+	}
+	if factor > 1 {
+		shift *= uint64(factor)
+	}
+	if id > shift {
+		return id - shift
+	}
+	return 1
+}
+
 type tikvClient struct {
-	client     *tikv.KVStore
-	gcInterval time.Duration
+	client          *tikv.KVStore
+	gcInterval      time.Duration
+	changeLogShards int
 }
 
 func (c *tikvClient) name() string {

@@ -48,10 +48,10 @@ const awsDefaultRegion = "us-east-1"
 const s3RequestIDKey = "X-Amz-Request-Id"
 
 type s3client struct {
+	tierStorage
 	s3              *s3.Client
 	bucket          string
 	region          string
-	sc              string
 	disableChecksum bool
 }
 
@@ -114,7 +114,8 @@ func (s *s3client) Head(ctx context.Context, key string) (Object, error) {
 		*r.ContentLength,
 		*r.LastModified,
 		strings.HasSuffix(key, "/"),
-		string(r.StorageClass),
+		getOrDefaultScValue(string(r.StorageClass), string(types.StorageClassStandard)),
+		aws.ToString(r.Restore),
 	}, nil
 }
 
@@ -152,6 +153,7 @@ func (s *s3client) Get(ctx context.Context, key string, off, limit int64, getter
 }
 
 func (s *s3client) Put(ctx context.Context, key string, in io.Reader, getters ...AttrGetter) error {
+	sc := s.GetStorageClass(ctx)
 	var body io.ReadSeeker
 	if b, ok := in.(io.ReadSeeker); ok {
 		body = b
@@ -168,7 +170,7 @@ func (s *s3client) Put(ctx context.Context, key string, in io.Reader, getters ..
 		Key:               &key,
 		Body:              body,
 		ContentType:       &mimeType,
-		StorageClass:      types.StorageClass(s.sc),
+		StorageClass:      types.StorageClass(sc),
 		ChecksumAlgorithm: "", // X-Amz-Content-Sha256: UNSIGNED-PAYLOAD
 	}
 	if !s.disableChecksum {
@@ -176,7 +178,7 @@ func (s *s3client) Put(ctx context.Context, key string, in io.Reader, getters ..
 		params.Metadata = map[string]string{checksumAlgr: checksum}
 	}
 	attrs := ApplyGetters(getters...)
-	attrs.SetStorageClass(s.sc)
+	attrs.SetStorageClass(sc)
 	resp, err := s.s3.PutObject(ctx, params)
 	if err != nil {
 		var re s3.ResponseError
@@ -192,12 +194,13 @@ func (s *s3client) Put(ctx context.Context, key string, in io.Reader, getters ..
 }
 
 func (s *s3client) Copy(ctx context.Context, dst, src string) error {
+	sc := getOrDefaultScValue(s.GetStorageClass(ctx), string(types.StorageClassStandard))
 	src = s.bucket + "/" + src
 	params := &s3.CopyObjectInput{
 		Bucket:       &s.bucket,
 		Key:          &dst,
 		CopySource:   &src,
-		StorageClass: types.StorageClass(s.sc),
+		StorageClass: types.StorageClass(sc),
 	}
 	_, err := s.s3.CopyObject(ctx, params)
 	return err
@@ -261,7 +264,8 @@ func (s *s3client) List(ctx context.Context, prefix, start, token, delimiter str
 			*o.Size,
 			*o.LastModified,
 			strings.HasSuffix(oKey, "/"),
-			string(o.StorageClass),
+			getOrDefaultScValue(string(o.StorageClass), string(types.ObjectStorageClassStandard)),
+			"",
 		}
 	}
 	if delimiter != "" {
@@ -270,7 +274,7 @@ func (s *s3client) List(ctx context.Context, prefix, start, token, delimiter str
 			if err != nil {
 				return nil, false, "", errors.WithMessagef(err, "failed to decode commonPrefixes %s", *p.Prefix)
 			}
-			objs = append(objs, &obj{prefix, 0, time.Unix(0, 0), true, ""})
+			objs = append(objs, &obj{prefix, 0, time.Unix(0, 0), true, "", ""})
 		}
 		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
 	}
@@ -378,16 +382,28 @@ func (s *s3client) ListUploads(ctx context.Context, marker string) ([]*PendingPa
 	return parts, nextMarker, nil
 }
 
+func (s *s3client) Restore(ctx context.Context, key string) error {
+	_, err := s.s3.RestoreObject(ctx, &s3.RestoreObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+		RestoreRequest: &types.RestoreRequest{
+			Days:                 aws.Int32(defaultRestoreDays),
+			GlacierJobParameters: &types.GlacierJobParameters{Tier: types.TierStandard},
+		},
+	})
+	return err
+}
+
 func (s *s3client) SetStorageClass(sc string) error {
 	s.sc = sc
 	return nil
 }
 
-func autoS3Region(bucketName, accessKey, secretKey string) (string, error) {
+func autoS3Region(bucketName, accessKey, secretKey, token string) (string, error) {
 	var cfg aws.Config
 	var err error
 	if accessKey != "" {
-		cfg, err = config.LoadDefaultConfig(ctx, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")))
+		cfg, err = config.LoadDefaultConfig(ctx, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, token)))
 	} else {
 		cfg, err = config.LoadDefaultConfig(ctx)
 	}
@@ -491,7 +507,7 @@ func newS3(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) 
 		if len(hostParts) == 1 {
 			// take endpoint as bucketname
 			bucketName = hostParts[0]
-			if region, err = autoS3Region(bucketName, accessKey, secretKey); err != nil {
+			if region, err = autoS3Region(bucketName, accessKey, secretKey, token); err != nil {
 				return nil, fmt.Errorf("Can't guess your region for bucket %s: %s", bucketName, err)
 			}
 		} else {

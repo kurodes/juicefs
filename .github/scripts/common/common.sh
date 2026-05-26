@@ -19,18 +19,34 @@ init_platform() {
 }
 
 # Platform-agnostic functions with internal branching
+cleanup_test_mounts() {
+    case "$PLATFORM" in
+        mac)
+            for mp in ~/jfs3 ~/jfs2 ~/jfs; do
+                ./juicefs umount "$mp" 2>/dev/null || true
+                umount_jfs "$mp" "$META_URL"
+            done
+            ;;
+        linux)
+            for mp in /jfs3 /jfs2 /jfs; do
+                ./juicefs umount "$mp" 2>/dev/null || true
+                umount_jfs "$mp" "$META_URL"
+            done
+            ;;
+    esac
+}
+
 prepare_test() {
     case "$PLATFORM" in
         mac)
-            ./juicefs umount ~/jfs || true
-            umount_jfs ~/jfs "$META_URL"
+            cleanup_test_mounts
             sleep 1
             python3 .github/scripts/flush_meta.py "$META_URL"
             rm -rf ~/.juicefs/local/myjfs/ || true
             rm -rf ~/.juicefs/cache || true
             ;;
         linux)
-            umount_jfs /jfs "$META_URL"
+            cleanup_test_mounts
             python3 .github/scripts/flush_meta.py "$META_URL"
             rm -rf /var/jfs/myjfs || true
             rm -rf /var/jfsCache/myjfs || true
@@ -49,7 +65,7 @@ umount_jfs() {
     
     ls -l "$mp/.config"
     local status_log="status.log"
-    ./juicefs status --log-level error "$meta_url" 2>/dev/null | tee "$status_log"
+    ./juicefs status --log-level error "$meta_url" 2>/dev/null | grep -v '^\[xorm\]' | tee "$status_log"
     
     local pids
     pids=$(jq --arg mp "$mp" '.Sessions[] | select(.MountPoint == $mp) | .ProcessID' "$status_log")
@@ -83,26 +99,15 @@ wait_mount_process_killed() {
     
     echo "waiting for mount process $pid to exit within $wait_seconds seconds"
     for i in $(seq 1 "$wait_seconds"); do
-        case "$PLATFORM" in
-            mac)
-                if ! ps -p "$pid" > /dev/null; then
-                    echo "mount process is killed"
-                    break
-                fi
-                ;;
-            linux)
-                count=$(ps -ef | grep "juicefs mount" | awk '{print $2}' | grep "^$pid$" | wc -l)
-                if [ "$count" -eq 0 ]; then
-                    echo "mount process is killed"
-                    break
-                fi
-                ;;
-        esac
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "mount process is killed"
+            break
+        fi
         
         if [ "$i" -eq "$wait_seconds" ]; then
             case "$PLATFORM" in
                 mac)    ps -p "$pid";;
-                linux)  ps -ef | grep "juicefs mount" | grep -v "grep";;
+                linux)  ps -fp "$pid" 2>/dev/null || true;;
             esac
             echo "<FATAL>: mount process is not killed after $wait_seconds"
             exit 1
@@ -170,5 +175,5 @@ ensure_directory() {
 init_platform
 
 # Make functions available to subprocesses
-export -f prepare_test umount_jfs wait_mount_process_killed compare_md5sum wait_command_success ensure_directory
+export -f cleanup_test_mounts prepare_test umount_jfs wait_mount_process_killed compare_md5sum wait_command_success ensure_directory
 export PLATFORM META_URL

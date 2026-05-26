@@ -29,8 +29,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
@@ -38,15 +36,16 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
+	"github.com/aws/aws-sdk-go-v2/aws"
 )
 
 type wasb struct {
 	DefaultObjectStorage
 	container    *container.Client
 	azblobCli    *azblob.Client
-	sc           string
 	cName        string
 	useTokenAuth bool // true when using managed identity/token-based auth, false for shared key/connection string
+	tierStorage
 }
 
 func (b *wasb) String() string {
@@ -63,6 +62,13 @@ func (b *wasb) Create(ctx context.Context) error {
 	return err
 }
 
+func toValue[T any](p *T) (v T) {
+	if p == nil {
+		return v
+	}
+	return *p
+}
+
 func (b *wasb) Head(ctx context.Context, key string) (Object, error) {
 	properties, err := b.container.NewBlobClient(key).GetProperties(ctx, nil)
 	if err != nil {
@@ -71,13 +77,13 @@ func (b *wasb) Head(ctx context.Context, key string) (Object, error) {
 		}
 		return nil, err
 	}
-
 	return &obj{
 		key,
-		*properties.ContentLength,
-		*properties.LastModified,
+		toValue(properties.ContentLength),
+		toValue(properties.LastModified),
 		strings.HasSuffix(key, "/"),
-		*properties.AccessTier,
+		toValue(properties.AccessTier),
+		toValue(properties.ArchiveStatus),
 	}, nil
 }
 
@@ -102,17 +108,36 @@ func str2Tier(tier string) *blob2.AccessTier {
 }
 
 func (b *wasb) Put(ctx context.Context, key string, data io.Reader, getters ...AttrGetter) error {
+	sc := b.GetStorageClass(ctx)
 	options := azblob.UploadStreamOptions{}
-	if b.sc != "" {
-		options.AccessTier = str2Tier(b.sc)
+	if sc != "" {
+		options.AccessTier = str2Tier(sc)
 	}
 	resp, err := b.azblobCli.UploadStream(ctx, b.cName, key, data, &options)
 	attrs := ApplyGetters(getters...)
-	attrs.SetRequestID(aws.ToString(resp.RequestID)).SetStorageClass(b.sc)
+	attrs.SetRequestID(aws.ToString(resp.RequestID)).SetStorageClass(sc)
 	return err
 }
 
 func (b *wasb) Copy(ctx context.Context, dst, src string) error {
+	// If a tier ID is provided in the context and the source and destination are the same,
+	// we interpret this as a request to change the storage class (tier) of the existing blob without copying.
+	// In this case, we call SetTier on the blob client instead of performing a copy operation.
+	if id, ok := ctx.Value(TierKey{}).(uint8); ok && src == dst {
+		blobClient := b.azblobCli.ServiceClient().NewContainerClient(b.cName).NewBlobClient(src)
+		if t, ok := b.tiers[id]; ok {
+			tier := str2Tier(t.Sc)
+			if tier == nil {
+				return fmt.Errorf("tierID:%d not found for %s", id, src)
+			}
+			if _, err := blobClient.SetTier(ctx, *tier, &blob2.SetTierOptions{}); err != nil {
+				return err
+			}
+		} else {
+			return fmt.Errorf("invalid tier id: %d", id)
+		}
+		return nil
+	}
 	dstCli := b.container.NewBlobClient(dst)
 	srcCli := b.container.NewBlobClient(src)
 	options := &blob2.CopyFromURLOptions{}
@@ -174,13 +199,13 @@ func (b *wasb) List(ctx context.Context, prefix, startAfter, token, delimiter st
 		if *blob.Name <= startAfter {
 			continue
 		}
-		mtime := blob.Properties.LastModified
 		objs = append(objs, &obj{
 			*blob.Name,
-			*blob.Properties.ContentLength,
-			*mtime,
+			toValue(blob.Properties.ContentLength),
+			toValue(blob.Properties.LastModified),
 			strings.HasSuffix(*blob.Name, "/"),
-			string(*blob.Properties.AccessTier),
+			string(toValue(blob.Properties.AccessTier)),
+			"",
 		})
 	}
 
@@ -194,6 +219,11 @@ func (b *wasb) List(ctx context.Context, prefix, startAfter, token, delimiter st
 func (b *wasb) SetStorageClass(sc string) error {
 	b.sc = sc
 	return nil
+}
+
+// Restore Azure does not support restoring to a temporary read-only state; it can only directly permanently change the tier.
+func (b *wasb) Restore(ctx context.Context, key string) error {
+	return notSupported
 }
 
 // createAzureCredential creates a credential for Azure authentication.
@@ -213,56 +243,45 @@ func createAzureCredential() (azcore.TokenCredential, error) {
 	return cred, nil
 }
 
-func autoWasbEndpoint(containerName, accountName, scheme string, credential *azblob.SharedKeyCredential) (string, error) {
-	baseURLs := []string{"blob.core.windows.net", "blob.core.chinacloudapi.cn"}
-	endpoint := ""
-	for _, baseURL := range baseURLs {
-		if _, err := net.LookupIP(fmt.Sprintf("%s.%s", accountName, baseURL)); err != nil {
-			logger.Debugf("Attempt to resolve domain name %s failed: %s", baseURL, err)
-			continue
-		}
-		client, err := azblob.NewClientWithSharedKeyCredential(fmt.Sprintf("%s://%s.%s", scheme, accountName, baseURL), credential, nil)
-		if err != nil {
-			return "", err
-		}
-		if _, err = client.ServiceClient().GetProperties(ctx, nil); err != nil {
-			logger.Debugf("Try to get containers properties at %s failed: %s", baseURL, err)
-			continue
-		}
-		endpoint = baseURL
-		break
-	}
-
-	if endpoint == "" {
-		return "", fmt.Errorf("fail to get endpoint for container %s", containerName)
-	}
-	return endpoint, nil
+func normalizeSASToken(token string) string {
+	return strings.TrimPrefix(strings.TrimSpace(token), "?")
 }
 
-func autoWasbEndpointWithToken(containerName, accountName, scheme string, credential azcore.TokenCredential) (string, error) {
+func domainFromHost(hostParts []string) string {
+	if len(hostParts) <= 1 {
+		return ""
+	}
+	domain := hostParts[1]
+	if !strings.HasPrefix(domain, "blob") {
+		return fmt.Sprintf("blob.%s", domain)
+	}
+	return domain
+}
+
+func autoWasbEndpoint(accountName, scheme string, makeClient func(serviceURL string) (*azblob.Client, error)) (string, error) {
 	baseURLs := []string{"blob.core.windows.net", "blob.core.chinacloudapi.cn"}
-	endpoint := ""
+	var lastErr error
 	for _, baseURL := range baseURLs {
 		if _, err := net.LookupIP(fmt.Sprintf("%s.%s", accountName, baseURL)); err != nil {
 			logger.Debugf("Attempt to resolve domain name %s failed: %s", baseURL, err)
+			lastErr = err
 			continue
 		}
-		client, err := azblob.NewClient(fmt.Sprintf("%s://%s.%s", scheme, accountName, baseURL), credential, nil)
+		serviceURL := fmt.Sprintf("%s://%s.%s", scheme, accountName, baseURL)
+		client, err := makeClient(serviceURL)
 		if err != nil {
-			return "", err
+			logger.Debugf("Try to create client at %s failed: %s", baseURL, err)
+			lastErr = err
+			continue
 		}
 		if _, err = client.ServiceClient().GetProperties(ctx, nil); err != nil {
 			logger.Debugf("Try to get service properties at %s failed: %s", baseURL, err)
+			lastErr = err
 			continue
 		}
-		endpoint = baseURL
-		break
+		return baseURL, nil
 	}
-
-	if endpoint == "" {
-		return "", fmt.Errorf("fail to get endpoint for container %s", containerName)
-	}
-	return endpoint, nil
+	return "", fmt.Errorf("fail to auto-detect endpoint: %w", lastErr)
 }
 
 func newWasb(endpoint, accountName, accountKey, token string) (ObjectStorage, error) {
@@ -287,55 +306,66 @@ func newWasb(endpoint, accountName, accountKey, token string) (ObjectStorage, er
 		return &wasb{container: client.ServiceClient().NewContainerClient(containerName), azblobCli: client, cName: containerName, useTokenAuth: false}, nil
 	}
 
-	// Priority 2: Try managed identity / token-based authentication if no account key provided
+	// Priority 2: No account key — use SAS token or managed identity
 	if accountKey == "" {
-		logger.Debugf("No account key provided, attempting token-based authentication (managed identity, Azure CLI, etc.)")
+		domain := domainFromHost(hostParts)
+
+		normalized := normalizeSASToken(token)
+
+		if normalized != "" {
+			if domain == "" {
+				var err error
+				if domain, err = autoWasbEndpoint(accountName, uri.Scheme, func(serviceURL string) (*azblob.Client, error) {
+					return azblob.NewClientWithNoCredential(serviceURL+"?"+normalized, nil)
+				}); err != nil {
+					return nil, fmt.Errorf("Unable to get endpoint of container %s: %s", containerName, err)
+				}
+			}
+			sasURL := fmt.Sprintf("%s://%s.%s?%s", uri.Scheme, accountName, domain, normalized)
+			client, err := azblob.NewClientWithNoCredential(sasURL, nil)
+			if err != nil {
+				return nil, fmt.Errorf("Failed to create Azure blob client with SAS token: %v", err)
+			}
+			return &wasb{container: client.ServiceClient().NewContainerClient(containerName), azblobCli: client, cName: containerName, useTokenAuth: true}, nil
+		}
+
 		tokenCred, err := createAzureCredential()
 		if err != nil {
 			return nil, fmt.Errorf("Failed to create Azure credential (managed identity/Azure CLI): %v", err)
 		}
-
-		var domain string
-		if len(hostParts) > 1 {
-			domain = hostParts[1]
-			if !strings.HasPrefix(hostParts[1], "blob") {
-				domain = fmt.Sprintf("blob.%s", hostParts[1])
+		if domain == "" {
+			if domain, err = autoWasbEndpoint(accountName, uri.Scheme, func(serviceURL string) (*azblob.Client, error) {
+				return azblob.NewClient(serviceURL, tokenCred, nil)
+			}); err != nil {
+				return nil, fmt.Errorf("Unable to get endpoint of container %s: %s", containerName, err)
 			}
-		} else if domain, err = autoWasbEndpointWithToken(containerName, accountName, uri.Scheme, tokenCred); err != nil {
-			return nil, fmt.Errorf("Unable to get endpoint of container %s: %s", containerName, err)
 		}
-
 		serviceURL := fmt.Sprintf("%s://%s.%s", uri.Scheme, accountName, domain)
 		client, err := azblob.NewClient(serviceURL, tokenCred, nil)
 		if err != nil {
 			return nil, fmt.Errorf("Failed to create Azure blob client with token credential: %v", err)
 		}
-		logger.Debugf("Successfully authenticated using token-based credential")
 		return &wasb{container: client.ServiceClient().NewContainerClient(containerName), azblobCli: client, cName: containerName, useTokenAuth: true}, nil
 	}
 
-	// Priority 3: Shared key authentication (existing behavior)
-	logger.Debugf("Using Azure shared key authentication")
+	// Priority 3: Shared key authentication
 	credential, err := azblob.NewSharedKeyCredential(accountName, accountKey)
 	if err != nil {
 		return nil, err
 	}
-
-	var domain string
-	if len(hostParts) > 1 {
-		domain = hostParts[1]
-		if !strings.HasPrefix(hostParts[1], "blob") {
-			domain = fmt.Sprintf("blob.%s", hostParts[1])
+	domain := domainFromHost(hostParts)
+	if domain == "" {
+		if domain, err = autoWasbEndpoint(accountName, uri.Scheme, func(serviceURL string) (*azblob.Client, error) {
+			return azblob.NewClientWithSharedKeyCredential(serviceURL, credential, nil)
+		}); err != nil {
+			return nil, fmt.Errorf("Unable to get endpoint of container %s: %w", containerName, err)
 		}
-	} else if domain, err = autoWasbEndpoint(containerName, accountName, uri.Scheme, credential); err != nil {
-		return nil, fmt.Errorf("Unable to get endpoint of container %s: %s", containerName, err)
 	}
-
 	client, err := azblob.NewClientWithSharedKeyCredential(fmt.Sprintf("%s://%s.%s", uri.Scheme, accountName, domain), credential, nil)
 	if err != nil {
 		return nil, err
 	}
-	return &wasb{container: client.ServiceClient().NewContainerClient(containerName), azblobCli: client, cName: containerName, useTokenAuth: false}, nil
+	return &wasb{container: client.ServiceClient().NewContainerClient(containerName), azblobCli: client, cName: containerName}, nil
 }
 
 func init() {

@@ -46,11 +46,12 @@ message Xattr {
 }
 
 message Quota {
-  uint64 inode = 1;
+  uint64 key = 1;
   int64 maxSpace = 2;
   int64 maxInodes = 3;
   int64 usedSpace = 4;
   int64 usedInodes = 5;
+  uint32 type = 6;
 }
 
 message Stat {
@@ -90,6 +91,11 @@ message Symlink {
   bytes target = 2;
 }
 
+message ChangeLog {
+  int64 version = 1;
+  bytes entry = 2;
+}
+
 message Batch {
   repeated Node nodes = 1;
   repeated Edge edges = 2;
@@ -104,6 +110,7 @@ message Batch {
   repeated Quota quotas = 11;
   repeated Acl acls = 12;
   repeated Counter counters = 13;
+  repeated ChangeLog changelogs = 14;
 }
 
 message Footer {

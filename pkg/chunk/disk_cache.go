@@ -23,7 +23,6 @@ import (
 	"hash/fnv"
 	"io"
 	"io/fs"
-	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -342,18 +341,25 @@ func (cache *cacheStore) stats() (int64, int64) {
 	return int64(len(cache.pages) + cache.keys.len()), cache.used + cache.usedMemory()
 }
 
+func (cache *cacheStore) isFull(usage DiskFreeRatio, stage bool) bool {
+	if stage {
+		return usage.br < cache.freeRatio/2 || (usage.inodeCap > 0 && usage.fr < cache.freeRatio/2)
+	}
+	return usage.br < cache.freeRatio || (usage.inodeCap > 0 && usage.fr < cache.freeRatio)
+}
+
 func (cache *cacheStore) checkFreeSpace() {
 	for cache.available() {
 		usage := cache.curFreeRatio()
-		cache.stageFull = usage.br < cache.freeRatio/2 || (usage.inodeCap > 0 && usage.fr < cache.freeRatio/2)
-		cache.rawFull = usage.br < cache.freeRatio || (usage.inodeCap > 0 && usage.fr < cache.freeRatio)
+		cache.stageFull = cache.isFull(usage, true)
+		cache.rawFull = cache.isFull(usage, false)
 		if cache.rawFull && cache.keys.name() != EvictionNone {
 			logger.Tracef("Cleanup cache when check free space (%s): free ratio (%d%%), space usage (%d%%), inodes usage (%d%%)", cache.dir, int(cache.freeRatio*100), int(usage.br*100), int(usage.fr*100))
 			cache.Lock()
 			cache.cleanupFull()
 			cache.Unlock()
 			usage = cache.curFreeRatio()
-			cache.rawFull = usage.br < cache.freeRatio || (usage.inodeCap > 0 && usage.fr < cache.freeRatio)
+			cache.rawFull = cache.isFull(usage, false)
 		}
 		if cache.rawFull {
 			cache.uploadStaging()
@@ -411,11 +417,11 @@ func (cache *cacheStore) refreshCacheKeys() {
 	if cache.scanInterval < 0 {
 		return
 	}
-	cache.scanCached()
+	cache.scanCached(true)
 	if cache.scanInterval > 0 {
 		for {
 			time.Sleep(cache.scanInterval)
-			cache.scanCached()
+			cache.scanCached(false)
 		}
 	}
 }
@@ -499,7 +505,7 @@ func (cache *cacheStore) curFreeRatio() DiskFreeRatio {
 	return usage
 }
 
-func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool) (err error) {
+func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool, tierID uint8) (err error) {
 	if !cache.available() {
 		return errCacheDown
 	}
@@ -537,6 +543,14 @@ func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool) (er
 	if cache.checksum != CsNone {
 		if err = cache.writeFile(f, checksum(data)); err != nil {
 			logger.Warnf("Write checksum to cache file %s failed: %s", tmp, err)
+			_ = f.Close()
+			return
+		}
+	}
+	// write tierID into stage file
+	if tierID != 0 {
+		if err = cache.writeFile(f, []byte{tierID}); err != nil {
+			logger.Warnf("Write tier to cache file %s failed: %s", tmp, err)
 			_ = f.Close()
 			return
 		}
@@ -714,7 +728,7 @@ func (cache *cacheStore) flush() {
 	for {
 		w := <-cache.pending
 		path := cache.cachePath(w.key)
-		if cache.enabled() && cache.flushPage(path, w.page.Data, w.dropCache) == nil {
+		if cache.enabled() && cache.flushPage(path, w.page.Data, w.dropCache, 0) == nil {
 			cache.add(w.key, int32(len(w.page.Data)), uint32(time.Now().Unix()))
 		}
 		cache.Lock()
@@ -756,7 +770,7 @@ func (cache *cacheStore) add(key string, size int32, atime uint32) {
 	}
 }
 
-func (cache *cacheStore) stage(key string, data []byte) (string, error) {
+func (cache *cacheStore) stage(key string, data []byte, tierID uint8) (string, error) {
 	stagingPath := cache.stagePath(key)
 	if cache.stageFull {
 		return stagingPath, errStageFull
@@ -766,7 +780,7 @@ func (cache *cacheStore) stage(key string, data []byte) (string, error) {
 	}
 	stagingBlocks.Add(1)
 	defer stagingBlocks.Add(-1)
-	err := cache.flushPage(stagingPath, data, false)
+	err := cache.flushPage(stagingPath, data, false, tierID)
 	if err == nil {
 		cache.m.stageBlocks.Add(1)
 		cache.m.stageBlockBytes.Add(float64(len(data)))
@@ -788,6 +802,20 @@ func (cache *cacheStore) uploaded(key string, size int) {
 	cache.add(key, int32(size), 0)
 }
 
+func (cache *cacheStore) spaceToFree(usage DiskFreeRatio) int64 {
+	if usage.br < cache.freeRatio {
+		return int64(float64(usage.spaceCap) * float64(cache.freeRatio-usage.br))
+	}
+	return 0
+}
+
+func (cache *cacheStore) inodesToFree(usage DiskFreeRatio) int64 {
+	if usage.fr < cache.freeRatio {
+		return int64(float64(usage.inodeCap) * float64(cache.freeRatio-usage.fr))
+	}
+	return 0
+}
+
 // locked
 func (cache *cacheStore) cleanupFull() {
 	if !cache.available() {
@@ -803,20 +831,18 @@ func (cache *cacheStore) cleanupFull() {
 	// make sure we have enough free space after cleanup
 	usage := cache.curFreeRatio()
 	cache.Lock()
-	if usage.br < cache.freeRatio {
-		toFree := int64(float32(usage.spaceCap) * (cache.freeRatio - usage.br))
+	if toFree := cache.spaceToFree(usage); toFree > 0 {
 		if toFree > cache.used {
 			goal = 0
 		} else if cache.used-toFree < goal {
 			goal = (cache.used - toFree) * 95 / 100
 		}
 	}
-	if usage.fr < cache.freeRatio {
-		toFree := int(float32(usage.inodeCap) * (cache.freeRatio - usage.fr))
-		if toFree > cache.keys.len() {
+	if toFree := cache.inodesToFree(usage); toFree > 0 {
+		if toFree > int64(cache.keys.len()) {
 			num = 0
 		} else {
-			num = int64(cache.keys.len()-toFree) * 99 / 100
+			num = (int64(cache.keys.len()) - toFree) * 99 / 100
 		}
 	}
 	if int64(cache.keys.len()) <= num && cache.used <= goal {
@@ -856,10 +882,11 @@ func (cache *cacheStore) uploadStaging() {
 	if !cache.scanned || cache.uploader == nil {
 		return
 	}
-	var toFree int64
 	usage := cache.curFreeRatio()
-	if usage.br < cache.freeRatio || usage.fr < cache.freeRatio {
-		toFree = int64(float64(usage.spaceCap)*float64(cache.freeRatio) - math.Min(float64(usage.br), float64(usage.fr)))
+	spaceToFree := cache.spaceToFree(usage)
+	inodeToFree := cache.inodesToFree(usage)
+	if spaceToFree <= 0 && inodeToFree <= 0 {
+		return
 	}
 	cache.Lock()
 	defer cache.Unlock()
@@ -890,11 +917,12 @@ func (cache *cacheStore) uploadStaging() {
 			logger.Debugf("upload %s, age: %d", key, uint32(time.Now().Unix())-lastValue.atime)
 			cache.Lock()
 			// the size in keys should be updated
-			toFree -= int64(-lastValue.size + 4096)
+			spaceToFree -= int64(-lastValue.size + 4096)
+			inodeToFree--
 			cnt = 0
 		}
 
-		if toFree < 0 {
+		if spaceToFree <= 0 && inodeToFree <= 0 {
 			break
 		}
 	}
@@ -908,7 +936,7 @@ func (cache *cacheStore) uploadStaging() {
 	}
 }
 
-func (cache *cacheStore) scanCached() {
+func (cache *cacheStore) scanCached(fast bool) {
 	cache.Lock()
 	cache.used = 0
 	// atime in memory is more accurate than on disk, inherit it for the next round
@@ -921,7 +949,16 @@ func (cache *cacheStore) scanCached() {
 
 	cachePrefix := filepath.Join(cache.dir, cacheDir)
 	logger.Debugf("Scan %s to find cached blocks", cachePrefix)
-	_ = fastwalk.Walk(nil, cachePrefix, func(path string, d fs.DirEntry, err error) error {
+
+	walkDir := func(path string, walkFn fs.WalkDirFunc) error {
+		if fast {
+			return fastwalk.Walk(nil, path, walkFn)
+		} else {
+			return filepath.WalkDir(path, walkFn)
+		}
+	}
+
+	_ = walkDir(cachePrefix, func(path string, d fs.DirEntry, err error) error {
 		// this func should be concurrent safe
 		if err != nil {
 			return nil
@@ -1079,7 +1116,7 @@ type CacheManager interface {
 	load(key string) (ReadCloser, error)
 	exist(key string) (string, bool)
 	uploaded(key string, size int)
-	stage(key string, data []byte) (string, error)
+	stage(key string, data []byte, tierID uint8) (string, error)
 	removeStage(key string) error
 	stats() (int64, int64)
 	usedMemory() int64
@@ -1281,10 +1318,10 @@ func (m *cacheManager) remove(key string, staging bool) {
 	}
 }
 
-func (m *cacheManager) stage(key string, data []byte) (string, error) {
+func (m *cacheManager) stage(key string, data []byte, tierID uint8) (string, error) {
 	store := m.getStore(key)
 	if store != nil {
-		return store.stage(key, data)
+		return store.stage(key, data, tierID)
 	}
 	return "", errors.New("no available cache dir")
 }
@@ -1308,10 +1345,14 @@ const (
 
 var crc32c = crc32.MakeTable(crc32.Castagnoli)
 
+const tierIDLength = int64(1) // 1 byte for tierID in the end of cache file
+
 type cacheFile struct {
 	*os.File
-	length  int // length of data
-	csLevel string
+	length   int // length of data
+	csLevel  string
+	hasTier  bool
+	fileSize int64
 }
 
 // Calculate 32-bits checksum for every 32 KiB data, so 512 Bytes for 4 MiB in total
@@ -1340,15 +1381,21 @@ func openCacheFile(name string, length int, level string) (*cacheFile, error) {
 		return nil, err
 	}
 	checksumLength := ((length-1)/csBlock + 1) * 4
+	hasTier := false
 	switch fi.Size() - int64(length) {
 	case 0:
-		return &cacheFile{fp, length, CsNone}, nil
+		level = CsNone
+	case tierIDLength:
+		level = CsNone
+		hasTier = true
 	case int64(checksumLength):
-		return &cacheFile{fp, length, level}, nil
+	case int64(checksumLength) + tierIDLength:
+		hasTier = true
 	default:
 		_ = fp.Close()
 		return nil, fmt.Errorf("invalid file size %d, data length %d", fi.Size(), length)
 	}
+	return &cacheFile{File: fp, length: length, csLevel: level, hasTier: hasTier, fileSize: fi.Size()}, nil
 }
 
 func (cf *cacheFile) ReadAt(b []byte, off int64) (n int, err error) {
@@ -1425,4 +1472,22 @@ func (cf *cacheFile) ReadAt(b []byte, off int64) (n int, err error) {
 		}
 	}
 	return
+}
+
+func (cf *cacheFile) ReadTierID() (uint8, error) {
+	if !cf.hasTier {
+		return 0, nil
+	}
+	var buf [1]byte
+	n, err := cf.File.ReadAt(buf[:], cf.fileSize-tierIDLength)
+	if err != nil {
+		return 0, err
+	} else if n != 1 {
+		return 0, fmt.Errorf("invalid tierID length %d, expect %d", n, tierIDLength)
+	}
+	if buf[0] > 3 {
+		logger.Errorf("Invalid tierID %d in cache file %s", buf[0], cf.Name())
+		return 0, nil
+	}
+	return buf[0], nil
 }

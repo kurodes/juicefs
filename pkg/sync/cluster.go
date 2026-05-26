@@ -44,16 +44,23 @@ import (
 
 // Stat has the counters to represent the progress.
 type Stat struct {
-	Copied       int64    // the number of copied files
-	CopiedBytes  int64    // total amount of copied data in bytes
-	Checked      int64    // the number of checked files
-	CheckedBytes int64    // total amount of checked data in bytes
-	Deleted      int64    // the number of deleted files
-	Skipped      int64    // the number of files skipped
-	SkippedBytes int64    // total amount of skipped data in bytes
-	Failed       int64    // the number of files that fail to copy
-	DelayDelDir  []string // the directories that need to be deleted
+	Copied           int64                            // the number of copied files
+	CopiedBytes      int64                            // total amount of copied data in bytes
+	Checked          int64                            // the number of checked files
+	CheckedBytes     int64                            // total amount of checked data in bytes
+	Deleted          int64                            // the number of deleted files
+	Skipped          int64                            // the number of files skipped
+	SkippedBytes     int64                            // total amount of skipped data in bytes
+	Failed           int64                            // the number of files that fail to copy
+	DelayDelDir      []string                         // the directories that need to be deleted
+	CompletedKeys    []string                         `json:"completed_keys,omitempty"` // checkpoint: keys completed by this worker
+	FailedKeys       []string                         `json:"failed_keys,omitempty"`    // checkpoint: keys failed by this worker
+	MultipartUploads map[string]*multipartUploadState `json:"multipart_uploads,omitempty"`
 }
+
+var completionMu sync.Mutex
+var completedKeysBuf []string
+var failedKeysBuf []string
 
 func updateStats(r *Stat) {
 	copied.IncrInt64(r.Copied)
@@ -93,7 +100,74 @@ func httpRequest(url string, body []byte) (ans []byte, err error) {
 
 var sendStatMu sync.Mutex
 
-func sendStats(addr string) {
+func getMultipartUploads(uploads *workerMultipartUploads) map[string]*multipartUploadState {
+	if uploads == nil {
+		return nil
+	}
+	uploads.RLock()
+	defer uploads.RUnlock()
+	if len(uploads.dirtyParts) == 0 {
+		return nil
+	}
+	dirtyUploads := make(map[string]*multipartUploadState, len(uploads.dirtyParts))
+	for key, dirtyParts := range uploads.dirtyParts {
+		state := uploads.uploads[key]
+		if !state.isValid() || len(dirtyParts) == 0 {
+			continue
+		}
+		parts := make(map[int]object.Part, len(dirtyParts))
+		var checksums map[int]uint32
+		for num := range dirtyParts {
+			part, ok := state.Parts[num]
+			if !ok {
+				continue
+			}
+			parts[num] = part
+			if chksum, ok := state.Checksums[num]; ok {
+				if checksums == nil {
+					checksums = make(map[int]uint32)
+				}
+				checksums[num] = chksum
+			}
+		}
+		if len(parts) == 0 {
+			continue
+		}
+		dirtyUploads[key] = &multipartUploadState{
+			Upload:    state.Upload,
+			Size:      state.Size,
+			Mtime:     state.Mtime,
+			Parts:     parts,
+			Checksums: checksums,
+		}
+	}
+	if len(dirtyUploads) == 0 {
+		return nil
+	}
+	return dirtyUploads
+}
+
+func clearSentMultipartParts(workerUploads *workerMultipartUploads, uploads map[string]*multipartUploadState) {
+	if workerUploads == nil || len(uploads) == 0 {
+		return
+	}
+	workerUploads.Lock()
+	defer workerUploads.Unlock()
+	for key, sent := range uploads {
+		dirtyParts := workerUploads.dirtyParts[key]
+		if dirtyParts == nil {
+			continue
+		}
+		for num := range sent.Parts {
+			delete(dirtyParts, num)
+		}
+		if len(dirtyParts) == 0 {
+			delete(workerUploads.dirtyParts, key)
+		}
+	}
+}
+
+func sendStats(addr string, multipartUploads *workerMultipartUploads) {
 	sendStatMu.Lock()
 	defer sendStatMu.Unlock()
 	var r Stat
@@ -105,6 +179,12 @@ func sendStats(addr string) {
 	r.DelayDelDir = srcDelayDel
 	srcDelayDel = make([]string, 0)
 	srcDelayDelMu.Unlock()
+	completionMu.Lock()
+	r.CompletedKeys = completedKeysBuf
+	r.FailedKeys = failedKeysBuf
+	completedKeysBuf = make([]string, 0)
+	failedKeysBuf = make([]string, 0)
+	completionMu.Unlock()
 	if checked != nil {
 		r.Checked = checked.Current()
 		r.CheckedBytes = checkedBytes.Current()
@@ -115,12 +195,17 @@ func sendStats(addr string) {
 	if failed != nil {
 		r.Failed = failed.Current()
 	}
+	r.MultipartUploads = getMultipartUploads(multipartUploads)
 	d, _ := json.Marshal(r)
 	ans, err := httpRequest(fmt.Sprintf("http://%s/stats", addr), d)
 	if err != nil || string(ans) != "OK" {
 		srcDelayDelMu.Lock()
 		srcDelayDel = append(srcDelayDel, r.DelayDelDir...)
 		srcDelayDelMu.Unlock()
+		completionMu.Lock()
+		completedKeysBuf = append(r.CompletedKeys, completedKeysBuf...)
+		failedKeysBuf = append(r.FailedKeys, failedKeysBuf...)
+		completionMu.Unlock()
 		if errors.Is(err, syscall.ECONNREFUSED) {
 			logger.Errorf("the management process has been stopped, so the worker process now exits")
 			os.Exit(1)
@@ -141,10 +226,11 @@ func sendStats(addr string) {
 		if failed != nil {
 			failed.IncrInt64(-r.Failed)
 		}
+		clearSentMultipartParts(multipartUploads, r.MultipartUploads)
 	}
 }
 
-func startManager(config *Config, tasks <-chan object.Object) (string, error) {
+func startManager(config *Config, tasks <-chan object.Object, checkpointMgr *CheckpointManager) (string, error) {
 	http.HandleFunc("/fetch", func(w http.ResponseWriter, req *http.Request) {
 		var objs []object.Object
 		var total int64
@@ -166,6 +252,17 @@ func startManager(config *Config, tasks <-chan object.Object) (string, error) {
 				total += obj.Size()
 			default:
 				break LOOP
+			}
+		}
+		if checkpointMgr != nil {
+			for i, o := range objs {
+				nsize := o.Size()
+				base := withoutSize(o)
+				if base.Size() > multipartCheckpointThreshold && (nsize == base.Size() || nsize == markChecksum) {
+					if cp := checkpointMgr.GetMultipartCheckpoint(base.Key(), base.Size(), base.Mtime()); cp != nil {
+						objs[i] = withMultipart(o, cp)
+					}
+				}
 			}
 		}
 		d, err := marshalObjects(objs)
@@ -196,6 +293,17 @@ func startManager(config *Config, tasks <-chan object.Object) (string, error) {
 		srcDelayDelMu.Lock()
 		srcDelayDel = append(srcDelayDel, r.DelayDelDir...)
 		srcDelayDelMu.Unlock()
+		if checkpointMgr != nil {
+			for key, state := range r.MultipartUploads {
+				checkpointMgr.PutMultipartCheckpoint(key, state)
+			}
+			for _, key := range r.CompletedKeys {
+				checkpointMgr.MarkCompleted(key)
+			}
+			for _, key := range r.FailedKeys {
+				checkpointMgr.MarkFailed(key)
+			}
+		}
 		logger.Debugf("receive stats %+v from %s", r, req.RemoteAddr)
 		_, _ = w.Write([]byte("OK"))
 	})
@@ -270,15 +378,15 @@ func launchWorker(address string, config *Config, wg *sync.WaitGroup) {
 			rpath := filepath.Join("/tmp", filepath.Base(path))
 			cmd := exec.Command("rsync", "-a", "-e", "ssh -o StrictHostKeyChecking=no -o PasswordAuthentication=no", path, host+":"+rpath)
 			output, err := cmd.CombinedOutput()
-			logger.Debugf("exec: %s,err: %s", cmd.String(), string(output))
+			logger.Debugf("exec: %q,err: %s", cmd.String(), string(output))
 			if err != nil {
 				// fallback to scp
 				cmd = exec.Command("scp", "-o", "StrictHostKeyChecking=no", "-o", "PasswordAuthentication=no", path, host+":"+rpath)
 				output, err = cmd.CombinedOutput()
-				logger.Debugf("exec: %s,err: %s", cmd.String(), string(output))
+				logger.Debugf("exec: %q,err: %s", cmd.String(), string(output))
 			}
 			if err != nil {
-				logger.Errorf("copy itself to %s: %s", host, err)
+				logger.Errorf("copy itself to %q: %s", host, err)
 				return
 			}
 			// launch itself
@@ -308,7 +416,7 @@ func launchWorker(address string, config *Config, wg *sync.WaitGroup) {
 			for i, s := range printEnv {
 				argsBk[i+1] = s
 			}
-			logger.Debugf("launch worker command args: [ssh, %s]", strings.Join(shellescape.EscapeArgs(argsBk), ", "))
+			logger.Debugf("launch worker command args: [ssh, %q]", strings.Join(shellescape.EscapeArgs(argsBk), ", "))
 			cmd = exec.Command("ssh", shellescape.EscapeArgs(args)...)
 			cmd.Stdin = os.Stdin
 			stderr, err := cmd.StderrPipe()
@@ -317,10 +425,10 @@ func launchWorker(address string, config *Config, wg *sync.WaitGroup) {
 			}
 			err = cmd.Start()
 			if err != nil {
-				logger.Errorf("start itself at %s: %s", host, err)
+				logger.Errorf("start itself at %q: %s", host, err)
 				return
 			}
-			logger.Infof("launch a worker on %s", host)
+			logger.Infof("launch a worker on %q", host)
 			var finished = make(chan struct{})
 			var logRe = regexp.MustCompile(`^.*<([A-Z]+)>: (.*)`)
 			go func() {
@@ -344,20 +452,20 @@ func launchWorker(address string, config *Config, wg *sync.WaitGroup) {
 
 					switch level {
 					case "ERROR":
-						logger.Errorf("[%s] %s", host, content)
+						logger.Errorf("[%q] %s", host, content)
 					case "WARNING":
-						logger.Warnf("[%s] %s", host, content)
+						logger.Warnf("[%q] %s", host, content)
 					case "DEBUG":
-						logger.Debugf("[%s] %s", host, content)
+						logger.Debugf("[%q] %s", host, content)
 					default:
-						logger.Infof("[%s] %s", host, content)
+						logger.Infof("[%q] %s", host, content)
 					}
 				}
 			}()
 			err = cmd.Wait()
 			<-finished
 			if err != nil {
-				logger.Errorf("%s: %s", host, err)
+				logger.Errorf("%q: %s", host, err)
 			}
 		}(host)
 	}
@@ -366,11 +474,16 @@ func launchWorker(address string, config *Config, wg *sync.WaitGroup) {
 func marshalObjects(objs []object.Object) ([]byte, error) {
 	var arr []map[string]interface{}
 	for _, o := range objs {
+		cp := multipartCheckpoint(o)
+		o = withoutMultipart(o)
 		nsize := o.Size()
 		o = withoutSize(o)
 		obj := object.MarshalObject(o)
 		if nsize != o.Size() {
 			obj["nsize"] = nsize
+		}
+		if cp != nil {
+			obj["multipart_checkpoint"] = cp
 		}
 		arr = append(arr, obj)
 	}
@@ -389,12 +502,21 @@ func unmarshalObjects(d []byte) ([]object.Object, error) {
 		if nsize, ok := m["nsize"]; ok {
 			obj = withSize(obj, int64(nsize.(float64)))
 		}
+		if cpRaw, ok := m["multipart_checkpoint"]; ok {
+			cpBytes, err := json.Marshal(cpRaw)
+			if err == nil {
+				var cp multipartUploadState
+				if err := json.Unmarshal(cpBytes, &cp); err == nil {
+					obj = withMultipart(obj, &cp)
+				}
+			}
+		}
 		objs = append(objs, obj)
 	}
 	return objs, nil
 }
 
-func fetchJobs(tasks chan<- object.Object, config *Config) {
+func fetchJobs(tasks chan<- object.Object, config *Config, uploads multipartUploads) {
 	for {
 		url := fmt.Sprintf("http://%s/fetch", config.Manager)
 		ans, err := httpRequest(url, nil)
@@ -416,6 +538,12 @@ func fetchJobs(tasks chan<- object.Object, config *Config) {
 			break
 		}
 		for _, obj := range jobs {
+			if cp := multipartCheckpoint(obj); cp != nil {
+				if uploads != nil {
+					uploads.PutMultipartCheckpoint(obj.Key(), cp)
+				}
+				obj = withoutMultipart(obj)
+			}
 			tasks <- obj
 		}
 	}

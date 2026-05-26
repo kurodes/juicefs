@@ -57,6 +57,8 @@ import (
 
 var mountPid int
 
+const fuseConnectionsPath = "/sys/fs/fuse/connections"
+
 func showThreadStack(agentAddr string) {
 	if agentAddr == "" {
 		return
@@ -64,13 +66,20 @@ func showThreadStack(agentAddr string) {
 	client := http.Client{
 		Timeout: 10 * time.Second,
 	}
-	resp, err := client.Get(fmt.Sprintf("http://%s/debug/pprof/goroutine?debug=2", agentAddr))
-	if err != nil {
-		logger.Warnf("list goroutine from %s: %s", agentAddr, err)
-	} else {
+	fn := func(level int) error {
+		resp, err := client.Get(fmt.Sprintf("http://%s/debug/pprof/goroutine?debug=%d", agentAddr, level))
+		if err != nil {
+			return err
+		}
 		grs, _ := io.ReadAll(resp.Body)
-		logger.Infof("list goroutines from %s:\n%s", agentAddr, string(grs))
+		logger.Infof("list goroutines (debug=%d) from %s:\n%s", level, agentAddr, string(grs))
 		_ = resp.Body.Close()
+		return nil
+	}
+	if err := fn(1); err == nil {
+		if err := fn(2); err != nil {
+			logger.Warnf("list goroutines debug=2 from %s: %s", agentAddr, err)
+		}
 	}
 }
 
@@ -81,39 +90,65 @@ func devMinor(dev uint64) uint32 {
 	return uint32(minor)
 }
 
+func processExists(pid int) bool {
+	p, _ := os.FindProcess(pid)
+	return p.Signal(syscall.Signal(0)) == nil
+}
+
+func waitProcessExit(pid int, timeout, interval time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !processExists(pid) {
+			return true
+		}
+		time.Sleep(interval)
+	}
+	return !processExists(pid)
+}
+
 func killMountProcess(pid int, dev uint64, lastActive *int64) {
 	if pid > 0 {
 		logger.Infof("watchdog: kill %d", pid)
 		err := syscall.Kill(pid, syscall.SIGABRT)
 		if err != nil {
-			logger.Warnf("kill %d: %s", pid, err)
+			logger.Warnf("kill %d with SIGABRT: %v", pid, err)
+		} else if !waitProcessExit(pid, 30*time.Second, 500*time.Millisecond) {
+			logger.Warnf("process %d is still alive after SIGABRT grace period. Kill it: %d", pid, pid)
 			_ = syscall.Kill(pid, syscall.SIGKILL)
 		}
 		// double check
-		time.Sleep(time.Second * 10)
+		time.Sleep(time.Second * 30)
 		if atomic.LoadInt64(lastActive)+30 > time.Now().Unix() {
 			return
 		}
 	}
-	if runtime.GOOS == "linux" && dev > 0 {
-		tids, _ := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
-		for _, tid := range tids {
-			stack, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%s/stack", pid, tid))
-			if err == nil && bytes.Contains(stack, []byte("fuse_simple_request")) {
-				logger.Errorf("find deadlock in mount process, abort it: %s", string(stack))
-				if fuseFd > 0 {
-					_ = syscall.Close(fuseFd)
-					fuseFd = 0
-				}
-				f, err := os.OpenFile(fmt.Sprintf("/sys/fs/fuse/connections/%d/abort", devMinor(dev)), os.O_WRONLY, 0777)
-				if err != nil {
-					logger.Warn(err)
-				} else {
-					_, _ = f.WriteString("1")
-					_ = f.Close()
-				}
-				break
+	if runtime.GOOS != "linux" || dev == 0 {
+		return
+	}
+	conn := devMinor(dev)
+	data, err := os.ReadFile(filepath.Join(fuseConnectionsPath, strconv.FormatUint(uint64(conn), 10), "waiting"))
+	if err == nil {
+		waiting, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err == nil && waiting > 0 {
+			fuseMu.Lock()
+			if fuseFd > 0 {
+				_ = syscall.Close(fuseFd)
+				fuseFd = 0
 			}
+			fuseMu.Unlock()
+			f, err := os.OpenFile(filepath.Join(fuseConnectionsPath, strconv.FormatUint(uint64(conn), 10), "abort"), os.O_WRONLY, 0)
+			if err != nil {
+				logger.Warn(err)
+				return
+			}
+			defer func() { _ = f.Close() }()
+			if _, err = f.WriteString("1"); err != nil {
+				logger.Warn(err)
+				return
+			}
+			logger.Warnf("watchdog: FUSE abort triggered for connection %d, pid %d", conn, pid)
+		} else if err != nil {
+			logger.Warnf("watchdog: failed to parse waiting FUSE requests for connection %d, pid %d: %v; abort not triggered", conn, pid, err)
 		}
 	}
 }
@@ -133,14 +168,54 @@ func loadConfig(path string) (string, *vfs.Config, error) {
 	return "", nil, fmt.Errorf("%s is not inside JuiceFS", path)
 }
 
+func printThreadsStack(pid int) {
+	if pid <= 1 {
+		return
+	}
+	start := time.Now()
+	tids, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
+	if err != nil {
+		logger.Warnf("list tasks of pid %d: %s", pid, err)
+		return
+	}
+	var b strings.Builder
+	for _, tid := range tids {
+		readThreadStats(pid, tid.Name(), &b)
+	}
+	logger.Infof("print kernel stacks of process %d takes %s:\n%s", pid, time.Since(start), b.String())
+}
+
+func readThreadStats(pid int, tid string, b *strings.Builder) {
+	dpath := fmt.Sprintf("/proc/%d/task/%s", pid, tid)
+	data, err := os.ReadFile(dpath + "/status")
+	if err != nil {
+		fmt.Fprintf(b, "%s failed: %s\n", dpath, err)
+		return
+	}
+	for _, s := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(s, "State:") {
+			fmt.Fprintf(b, "%s %s\n", dpath, s)
+			break
+		}
+	}
+	if data, err = os.ReadFile(dpath + "/stack"); err == nil {
+		b.WriteString(string(data))
+	}
+	if data, err = os.ReadFile(dpath + "/schedstat"); err == nil {
+		fmt.Fprintf(b, "schedstat: %s", data)
+	}
+	if data, err = os.ReadFile(dpath + "/syscall"); err == nil {
+		fmt.Fprintf(b, "syscall: %s", data)
+	}
+}
+
 func watchdog(ctx context.Context, mp string) {
-	var lastActive int64
+	var lastActive int64 = time.Now().Unix()
 	var pid int
 	var agentAddr string
 	var dev uint64
 	go func() {
 		time.Sleep(time.Millisecond * 100) // wait for child process
-		atomic.StoreInt64(&lastActive, time.Now().Unix())
 		for ctx.Err() == nil {
 			var confName = ".config"
 			if !vfs.IsSpecialName(confName) {
@@ -159,7 +234,7 @@ func watchdog(ctx context.Context, mp string) {
 				if pid == 0 {
 					_, conf, err := loadConfig(mp)
 					if err == nil {
-						logger.Infof("watching %s, pid %d", mp, conf.Pid)
+						logger.Infof("watching %q, pid %d", mp, conf.Pid)
 						pid = conf.Pid
 						agentAddr = conf.Port.DebugAgent
 					} else {
@@ -173,19 +248,36 @@ func watchdog(ctx context.Context, mp string) {
 		}
 	}()
 	for ctx.Err() == nil {
-		now := time.Now().Unix()
-		if atomic.LoadInt64(&lastActive)+30 < now {
-			showThreadStack(agentAddr)
-			time.Sleep(time.Second * 30)
+		la := atomic.LoadInt64(&lastActive)
+		if time.Since(time.Unix(la, 0)) > time.Second*30 {
+			logger.Infof("mount point %q is not active for %s, start another check thread", mp, time.Since(time.Unix(la, 0)))
+			go printThreadsStack(pid)
+			go showThreadStack(agentAddr)
+			time.Sleep(time.Minute)
 			// double check
-			if atomic.LoadInt64(&lastActive)+60 < time.Now().Unix() && ctx.Err() == nil {
-				logger.Infof("mount point %s is not active for %s", mp, time.Since(time.Unix(atomic.LoadInt64(&lastActive), 0)))
-				showThreadStack(agentAddr)
-				killMountProcess(pid, dev, &lastActive)
-				atomic.StoreInt64(&lastActive, time.Now().Unix())
-				pid = 0
-				dev = 0
+			if ctx.Err() != nil {
+				break
 			}
+			if n := atomic.LoadInt64(&lastActive); n != la {
+				logger.Infof("last active time is updated from %d to %d (delta %ds), re-check", la, n, n-la)
+				continue
+			}
+			logger.Infof("mount point %q is not active for %s, print the stacks again", mp, time.Since(time.Unix(la, 0)))
+			go printThreadsStack(pid)
+			go showThreadStack(agentAddr)
+			time.Sleep(time.Second * 30)
+			if ctx.Err() != nil {
+				break
+			}
+			if n := atomic.LoadInt64(&lastActive); n != la {
+				logger.Infof("last active time is updated from %d to %d (delta %ds), re-check", la, n, n-la)
+				continue
+			}
+			logger.Infof("mount point %q is not active for %s", mp, time.Since(time.Unix(la, 0)))
+			killMountProcess(pid, dev, &lastActive)
+			atomic.StoreInt64(&lastActive, time.Now().Unix())
+			pid = 0
+			dev = 0
 		}
 		time.Sleep(time.Second * 10)
 	}
@@ -207,7 +299,7 @@ func parseFuseFd(mountPoint string) (fd int) {
 
 func checkMountpoint(name, mp, logPath string, background bool) {
 	if parseFuseFd(mp) > 0 {
-		logger.Infof("\033[92mOK\033[0m, %s with special mount point %s", name, mp)
+		logger.Infof("\033[92mOK\033[0m, %s with special mount point %q", name, mp)
 		return
 	}
 	_, oldConf, _ := loadConfig(mp)
@@ -232,7 +324,7 @@ func checkMountpoint(name, mp, logPath string, background bool) {
 						continue
 					}
 				}
-				logger.Infof("\033[92mOK\033[0m, %s is ready at %s", name, mp)
+				logger.Infof("\033[92mOK\033[0m, %s is ready at %q", name, mp)
 				return
 			}
 		}
@@ -246,7 +338,7 @@ func checkMountpoint(name, mp, logPath string, background bool) {
 		_ = syscall.Kill(mountPid, syscall.SIGABRT) // Kill and show stack trace
 	}
 	if background {
-		logger.Fatalf("The mount point is not ready in %d seconds (%s), please check the log (%s) or re-mount in foreground", mountTimeOut, mountDesc, logPath)
+		logger.Fatalf("The mount point is not ready in %d seconds (%s), please check the log (%q) or re-mount in foreground", mountTimeOut, mountDesc, logPath)
 	} else {
 		logger.Fatalf("The mount point is not ready in %d seconds (%s), exit it", mountTimeOut, mountDesc)
 	}
@@ -260,7 +352,7 @@ func checkSvcPort(address string) {
 		conn, err := net.DialTimeout("tcp", address, 500*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
-			logger.Infof("\033[92mOK\033[0m, service is ready on %s", address)
+			logger.Infof("\033[92mOK\033[0m, service is ready on %q", address)
 			return
 		}
 		_, _ = os.Stdout.WriteString(".")
@@ -287,15 +379,15 @@ func makeDaemonForSvc(c *cli.Context, m meta.Meta, metaUrl, listenAddr string) e
 		var err error
 		attrs.Stdout, err = os.OpenFile(logfile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
-			logger.Errorf("open log file %s: %s", logfile, err)
+			logger.Errorf("open log file %q: %s", logfile, err)
 		} else {
-			logger.Infof("open log file %s", logfile)
+			logger.Infof("open log file %q", logfile)
 		}
 
 		conn, err := net.DialTimeout("tcp", listenAddr, 500*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
-			logger.Fatalf("unable to start the server: %s is already in use", listenAddr)
+			logger.Fatalf("unable to start the server: %q is already in use", listenAddr)
 		}
 	}
 	if godaemon.Stage() <= 1 {
@@ -512,17 +604,17 @@ func prepareMp(mp string) {
 		if err2 != nil {
 			if os.IsExist(err2) || strings.Contains(err2.Error(), "timeout after 3s") {
 				// a broken mount point, umount it
-				logger.Infof("mountpoint %s is broken: %s, umount it", mp, err)
+				logger.Infof("mountpoint %q is broken: %s, umount it", mp, err)
 				_ = doUmount(mp, true)
 			} else {
-				logger.Fatalf("create %s: %s", mp, err2)
+				logger.Fatalf("create %q: %s", mp, err2)
 			}
 		}
 	} else if err == nil {
 		ino, _ = utils.GetFileInode(mp)
 		if ino <= uint64(meta.RootInode) && fi.Size() == 0 {
 			// a broken mount point, umount it
-			logger.Infof("mountpoint %s is broken (ino=%d, size=%d), umount it", mp, ino, fi.Size())
+			logger.Infof("mountpoint %q is broken (ino=%d, size=%d), umount it", mp, ino, fi.Size())
 			_ = doUmount(mp, true)
 		}
 	}
@@ -538,14 +630,14 @@ func prepareMp(mp string) {
 		if fi, err := os.Stat(mp); err == nil {
 			if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 				if st.Uid != uint32(os.Getuid()) {
-					logger.Fatalf("current user should own %s", mp)
+					logger.Fatalf("current user should own %q", mp)
 				}
 			}
 		}
 	case "linux":
 		f, err := os.CreateTemp(mp, ".test")
 		if err != nil && (os.IsPermission(err) || errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EROFS)) {
-			logger.Fatalf("Do not have write permission on %s", mp)
+			logger.Fatalf("Do not have write permission on %q", mp)
 		} else if f != nil {
 			_ = f.Close()
 			_ = os.Remove(f.Name())
@@ -564,7 +656,7 @@ func genFuseOptExt(c *cli.Context, format *meta.Format) (fuseOpt string, mt int,
 func shutdownGraceful(mp string) {
 	_, conf, err := loadConfig(mp)
 	if err != nil {
-		logger.Warnf("load config from %s: %s", mp, err)
+		logger.Warnf("load config from %q: %s", mp, err)
 		return
 	}
 	fuseFd, fuseSetting = getFuseFd(conf.CommPath)
@@ -584,7 +676,7 @@ func shutdownGraceful(mp string) {
 		}
 		time.Sleep(time.Millisecond * 100)
 	}
-	logger.Infof("mount point %s is busy, stop upgrade, mount on top of it", mp)
+	logger.Infof("mount point %q is busy, stop upgrade, mount on top of it", mp)
 	err = sendFuseFd(conf.CommPath, fuseSetting, fuseFd)
 	if err != nil {
 		logger.Warnf("send FUSE fd: %s", err)
@@ -605,7 +697,7 @@ func canShutdownGracefully(mp string, newConf *vfs.Config) bool {
 		return err
 	}, time.Second*3)
 	if err != nil {
-		logger.Warnf("get inode of %s: %s", mp, err)
+		logger.Warnf("get inode of %q: %s", mp, err)
 		_ = doUmount(mp, true)
 		return false
 	} else if ino != 1 {
@@ -619,7 +711,7 @@ func canShutdownGracefully(mp string, newConf *vfs.Config) bool {
 		return false
 	}
 	if oldConf.Pid == 0 || oldConf.CommPath == "" {
-		logger.Infof("mount point %s is not ready for upgrade, mount on top of it", mp)
+		logger.Infof("mount point %q is not ready for upgrade, mount on top of it", mp)
 		return false
 	}
 	if oldConf.Format.Name != newConf.Format.Name {
@@ -649,12 +741,12 @@ func absPath(d string) string {
 		if h, err := os.UserHomeDir(); err == nil {
 			return filepath.Join(h, d[1:])
 		} else {
-			logger.Fatalf("Expand user home dir of %s: %s", d, err)
+			logger.Fatalf("Expand user home dir of %q: %s", d, err)
 		}
 	}
 	d, err := filepath.Abs(d)
 	if err != nil {
-		logger.Fatalf("Expand %s: %s", d, err)
+		logger.Fatalf("Expand %q: %s", d, err)
 	}
 	return d
 }
@@ -816,7 +908,7 @@ func makeDaemon(c *cli.Context, conf *vfs.Config) error {
 		_ = os.MkdirAll(filepath.Dir(logfile), 0755)
 		attrs.Stdout, err = os.OpenFile(logfile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
-			logger.Errorf("open log file %s: %s", logfile, err)
+			logger.Errorf("open log file %q: %s", logfile, err)
 		}
 	}
 	_, _, err := godaemon.MakeDaemon(&attrs)
@@ -996,7 +1088,7 @@ func parseUIDGID(input string, defaultUid uint32, defaultGid uint32) (uint32, ui
 	if ss[0] != "" {
 		u, err := strconv.ParseUint(ss[0], 10, 32)
 		if err != nil {
-			logger.Fatalf("invalid uid: %s", ss[0])
+			logger.Fatalf("invalid uid: %q", ss[0])
 		}
 		uid = uint32(u)
 		if uid == 0 {
@@ -1007,7 +1099,7 @@ func parseUIDGID(input string, defaultUid uint32, defaultGid uint32) (uint32, ui
 	if len(ss) == 2 && ss[1] != "" {
 		g, err := strconv.ParseUint(ss[1], 10, 32)
 		if err != nil {
-			logger.Fatalf("invalid gid: %s", ss[1])
+			logger.Fatalf("invalid gid: %q", ss[1])
 		}
 		gid = uint32(g)
 		if gid == 0 {
@@ -1060,10 +1152,9 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 			logger.Infof("Map root uid/gid 0 to %d/%d by setting root-squash", uid, gid)
 		}
 	}
-	logger.Infof("Mounting volume %s at %s ...", conf.Format.Name, conf.Meta.MountPoint)
+	logger.Infof("Mounting volume %s at %q ...", conf.Format.Name, conf.Meta.MountPoint)
 	err := fuse.Serve(v, c.String("o"), c.Bool("enable-xattr"), c.Bool("enable-ioctl"))
 	if err != nil {
 		logger.Fatalf("fuse: %s", err)
 	}
 }
-

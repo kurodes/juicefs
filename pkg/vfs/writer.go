@@ -41,7 +41,7 @@ type FileWriter interface {
 }
 
 type DataWriter interface {
-	Open(inode Ino, fleng uint64) FileWriter
+	Open(inode Ino, fleng uint64, tierID uint8) FileWriter
 	Flush(ctx meta.Context, inode Ino) syscall.Errno
 	GetLength(inode Ino) uint64
 	Truncate(inode Ino, length uint64)
@@ -63,6 +63,10 @@ type sliceWriter struct {
 	notify  *utils.Cond
 	started time.Time
 	lastMod time.Time
+
+	growing   bool
+	committed bool
+	dep       *sliceWriter
 }
 
 func (s *sliceWriter) prepareID(ctx meta.Context, retry bool) {
@@ -193,6 +197,9 @@ func (c *chunkWriter) commitThread() {
 				go s.flushData()
 			}
 		}
+		for s.dep != nil && !s.dep.committed {
+			f.commitcond.WaitWithTimeout(time.Millisecond * 100)
+		}
 		err := s.err
 		f.Unlock()
 
@@ -215,6 +222,10 @@ func (c *chunkWriter) commitThread() {
 			f.err = err
 			logger.Errorf("write inode:%d indx:%d %s", f.inode, c.indx, err)
 		}
+		s.committed = true
+		if s.growing {
+			f.commitcond.Broadcast()
+		}
 		c.slices = c.slices[1:]
 	}
 	f.freeChunk(c)
@@ -227,14 +238,16 @@ type fileWriter struct {
 
 	inode        Ino
 	length       uint64
+	tierID       uint8
 	err          syscall.Errno
 	flushwaiting uint16
 	writewaiting uint16
 	refs         uint16
 	chunks       map[uint32]*chunkWriter
 
-	flushcond *utils.Cond // wait for chunks==nil (flush)
-	writecond *utils.Cond // wait for flushwaiting==0 (write)
+	flushcond  *utils.Cond // wait for chunks==nil (flush)
+	writecond  *utils.Cond // wait for flushwaiting==0 (write)
+	commitcond *utils.Cond // wait for committed==true of dependency slice (commit)
 }
 
 // protected by file
@@ -263,7 +276,7 @@ func (f *fileWriter) writeChunk(ctx meta.Context, indx uint32, off uint32, data 
 		s = &sliceWriter{
 			chunk:   c,
 			off:     off,
-			writer:  f.w.store.NewWriter(0),
+			writer:  f.w.store.NewWriter(0, f.tierID),
 			notify:  utils.NewCond(&f.Mutex),
 			started: time.Now(),
 		}
@@ -274,7 +287,28 @@ func (f *fileWriter) writeChunk(ctx meta.Context, indx uint32, off uint32, data 
 			f.refs++
 			f.w.Unlock()
 			go c.commitThread()
+			if uint64(indx)*meta.ChunkSize >= f.length {
+				// first slice of a new chunk, try to find the last slice of the last chunk as dependency
+				var lastChunk *chunkWriter
+				for i, c := range f.chunks {
+					if i < indx && (lastChunk == nil || i > lastChunk.indx) {
+						lastChunk = c
+					}
+				}
+				if lastChunk != nil {
+					var lastSlice *sliceWriter
+					for _, s := range lastChunk.slices {
+						if s.growing {
+							lastSlice = s
+						}
+					}
+					s.dep = lastSlice
+				}
+			}
 		}
+	}
+	if !s.growing && uint64(indx)*meta.ChunkSize+uint64(off)+uint64(len(data)) > f.length {
+		s.growing = true
 	}
 	return s.write(ctx, off-s.off, data)
 }
@@ -294,10 +328,7 @@ func (w *dataWriter) usedBufferSize() int64 {
 }
 
 func (f *fileWriter) Write(ctx meta.Context, off uint64, data []byte) syscall.Errno {
-	for {
-		if f.totalSlices() < 1000 {
-			break
-		}
+	for f.totalSlices() >= 1000 {
 		time.Sleep(time.Millisecond)
 	}
 	if f.w.usedBufferSize() > f.w.bufferSize {
@@ -481,7 +512,7 @@ func (w *dataWriter) flushAll() {
 	}
 }
 
-func (w *dataWriter) Open(inode Ino, len uint64) FileWriter {
+func (w *dataWriter) Open(inode Ino, len uint64, tierID uint8) FileWriter {
 	w.Lock()
 	defer w.Unlock()
 	f, ok := w.files[inode]
@@ -490,10 +521,12 @@ func (w *dataWriter) Open(inode Ino, len uint64) FileWriter {
 			w:      w,
 			inode:  inode,
 			length: len,
+			tierID: tierID,
 			chunks: make(map[uint32]*chunkWriter),
 		}
 		f.flushcond = utils.NewCond(f)
 		f.writecond = utils.NewCond(f)
+		f.commitcond = utils.NewCond(f)
 		w.files[inode] = f
 	}
 	f.refs++

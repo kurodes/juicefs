@@ -29,6 +29,7 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,6 +37,7 @@ import (
 	"time"
 
 	aclAPI "github.com/juicedata/juicefs/pkg/acl"
+	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
 	"github.com/pkg/errors"
@@ -108,6 +110,7 @@ type engine interface {
 	doDelQuota(ctx Context, qtype uint32, key uint64) error
 	doLoadQuotas(ctx Context) (map[uint64]*Quota, map[uint64]*Quota, map[uint64]*Quota, error)
 	doFlushQuotas(ctx Context, quotas []*iQuota) error
+	cleanUgUsage(ctx Context, qtype uint32) error
 
 	doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno
 	doSetAttr(ctx Context, inode Ino, set uint16, sugidclearmode uint8, attr *Attr, oldAttr *Attr) syscall.Errno
@@ -136,7 +139,7 @@ type engine interface {
 	// @trySync: try sync dir stat if broken or not existed
 	doGetDirStat(ctx Context, ino Ino, trySync bool) (*dirStat, syscall.Errno)
 	doSyncDirStat(ctx Context, ino Ino) (*dirStat, syscall.Errno)
-	doSyncVolumeStat(ctx Context) error
+	doSyncVolumeStat(ctx Context, used, inodes int64) error
 
 	scanTrashSlices(Context, trashSliceScan) error
 	scanPendingSlices(Context, pendingSliceScan) error
@@ -155,6 +158,8 @@ type engine interface {
 	doDeleteTokens(ctx Context, ids []uint32) syscall.Errno
 	doListTokens(ctx Context) (tokens map[uint32][]byte, st syscall.Errno)
 
+	doCleanupChangelog(ctx Context, maxAge time.Duration, maxLines int64) error
+
 	newDirHandler(inode Ino, plus bool, entries []*Entry) DirHandler
 
 	dump(ctx Context, opt *DumpOption, ch chan<- *dumpedResult) error
@@ -164,7 +169,7 @@ type engine interface {
 
 type trashSliceScan func(ss []Slice, ts int64) (clean bool, err error)
 type pendingSliceScan func(id uint64, size uint32) (clean bool, err error)
-type trashFileScan func(inode Ino, size uint64, ts time.Time) (clean bool, err error)
+type trashFileScan func(inode Ino, size uint64, ts time.Time, count int64) (clean bool, err error)
 type pendingFileScan func(ino Ino, size uint64, ts int64) (clean bool, err error)
 
 // fsStat aligned for atomic operations
@@ -272,6 +277,7 @@ type baseMeta struct {
 	txlocks      [nlocks]sync.Mutex // Pessimistic locks to reduce conflict
 	subTrash     internalNode
 	sid          uint64
+	nextTxnId    uint64
 	of           *openfiles
 	removedFiles map[Ino]bool
 	compacting   map[uint64]bool
@@ -290,7 +296,7 @@ type baseMeta struct {
 	dSliceMu sync.Mutex
 	dSliceWG sync.WaitGroup
 
-	dirStatsLock sync.Mutex
+	dirStatsLock sync.RWMutex
 	dirStats     map[Ino]dirStat
 
 	fsStatsLock sync.Mutex
@@ -611,6 +617,28 @@ func (m *baseMeta) getBase() *baseMeta {
 	return m
 }
 
+func (m *baseMeta) getTxnId() uint64 {
+	return atomic.AddUint64(&m.nextTxnId, 1)
+}
+
+func logEncode(name []byte) string {
+	var escname = make([]byte, 0)
+	for _, c := range name {
+		if c < 32 || c >= 127 || c == ',' || c == '%' || c == '(' || c == ')' || c == '"' || c == '\\' {
+			escname = append(escname, '%')
+			escname = append(escname, CHARS[(c>>4)&0xF])
+			escname = append(escname, CHARS[c&0xF])
+		} else {
+			escname = append(escname, c)
+		}
+	}
+	return string(escname)
+}
+
+func logEncode2(name string) string {
+	return logEncode([]byte(name))
+}
+
 func (m *baseMeta) checkRoot(inode Ino) Ino {
 	switch inode {
 	case 0:
@@ -693,6 +721,10 @@ func (m *baseMeta) Load(checkVersion bool) (*Format, error) {
 			return nil, fmt.Errorf("check version: %s", err)
 		}
 	}
+	if format.Tiers == nil {
+		format.Tiers = object.NewTiers()
+	}
+	format.Tiers[0] = object.Tier{}
 	m.Lock()
 	m.fmt = format
 	m.Unlock()
@@ -776,6 +808,10 @@ func (m *baseMeta) NewSession(record bool) error {
 		go m.cleanupSlices(ctx)
 		go m.cleanupTrash(ctx)
 		go m.symlinks.clean(ctx, &m.sessWG)
+		if m.fmt.ChangeLog {
+			m.sessWG.Add(1)
+			go m.cleanupChangelog(ctx)
+		}
 	}
 	return nil
 }
@@ -937,7 +973,9 @@ func (m *baseMeta) CloseSession() error {
 	if m.sid > 0 {
 		err = m.en.doCleanStaleSession(m.sid)
 	}
-	m.sessCtx.Cancel()
+	if m.sessCtx != nil {
+		m.sessCtx.Cancel()
+	}
 	m.sessWG.Wait()
 	m.stopDeleteSliceTasks()
 	logger.Infof("close session %d: %v", m.sid, err)
@@ -1021,6 +1059,53 @@ func (m *baseMeta) cleanupSlices(ctx Context) {
 				m.bgjobDuration.WithLabelValues("cleanupSlices", status).Observe(time.Since(jobStart).Seconds())
 				m.bgjobDels.WithLabelValues("cleanupSlices").Add(float64(cnt))
 			}()
+		}
+	}
+}
+
+func parseChangelogTime(entry string) (time.Time, error) {
+	idx := strings.IndexByte(entry, '|')
+	if idx < 0 {
+		return time.Time{}, fmt.Errorf("invalid changelog entry: %s", entry)
+	}
+	timePart := entry[:idx]
+	dotIdx := strings.IndexByte(timePart, '.')
+	if dotIdx < 0 {
+		sec, err := strconv.ParseInt(timePart, 10, 64)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return time.Unix(sec, 0), nil
+	}
+	sec, err := strconv.ParseInt(timePart[:dotIdx], 10, 64)
+	if err != nil {
+		return time.Time{}, err
+	}
+	nsec, err := strconv.ParseInt(timePart[dotIdx+1:], 10, 64)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(sec, nsec), nil
+}
+
+func (m *baseMeta) cleanupChangelog(ctx Context) {
+	defer m.sessWG.Done()
+	for {
+		maxAge := time.Duration(m.fmt.ChangeLogMaxAge) * time.Second
+		maxLines := m.fmt.ChangeLogMaxLines
+		interval := 5 * time.Minute
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(utils.JitterIt(interval)):
+		}
+
+		if ok, err := m.en.setIfSmall("lastCleanupChangelog", time.Now().Unix(), int64((interval * 9 / 10).Seconds())); err != nil {
+			logger.Warnf("checking counter lastCleanupChangelog: %s", err)
+		} else if ok {
+			if err := m.en.doCleanupChangelog(ctx, maxAge, maxLines); err != nil {
+				logger.Warnf("cleanup changelog: %s", err)
+			}
 		}
 	}
 }
@@ -1227,6 +1312,7 @@ func (attr *Attr) reset() {
 	attr.Parent = 0
 	attr.AccessACL = aclAPI.None
 	attr.DefaultACL = aclAPI.None
+	attr.Tier = 0
 	attr.Full = false
 }
 
@@ -1278,8 +1364,25 @@ func clearSUGID(ctx Context, cur *Attr, set *Attr) {
 	}
 }
 
-func (r *baseMeta) Resolve(ctx Context, parent Ino, path string, inode *Ino, attr *Attr) syscall.Errno {
-	return syscall.ENOTSUP
+func (r *baseMeta) Resolve(ctx Context, parent Ino, dpath string, inode *Ino, attr *Attr, force bool) syscall.Errno {
+	if !force {
+		return syscall.ENOTSUP
+	}
+	*inode = RootInode
+	for dpath != "" {
+		ps := strings.SplitN(dpath, "/", 2)
+		if ps[0] != "" {
+			r := r.en.doLookup(ctx, *inode, ps[0], inode, attr)
+			if r != 0 {
+				return r
+			}
+		}
+		if len(ps) == 1 {
+			break
+		}
+		dpath = ps[1]
+	}
+	return 0
 }
 
 func (m *baseMeta) Access(ctx Context, inode Ino, mmask uint8, attr *Attr) syscall.Errno {
@@ -1452,6 +1555,33 @@ func (m *baseMeta) allocateInodes() (freeID, error) {
 	return freeID{next: uint64(v) - inodeBatch, maxid: uint64(v)}, nil
 }
 
+func (m *baseMeta) inheritGid(ctx Context, _type uint8, parentGid uint32, parentMode uint16) uint32 {
+	if ctx.Value(CtxKey("behavior")) == "Hadoop" || runtime.GOOS == "darwin" {
+		return parentGid
+	}
+	if runtime.GOOS == "linux" && parentMode&02000 != 0 {
+		return parentGid
+	}
+	return ctx.Gid()
+}
+
+func (m *baseMeta) inheritMode(ctx Context, _type uint8, parentGid uint32, parentMode, childMode uint16) uint16 {
+	if ctx.Value(CtxKey("behavior")) == "Hadoop" || runtime.GOOS == "darwin" {
+		return childMode
+	}
+	if runtime.GOOS == "linux" && parentMode&02000 != 0 {
+		if _type == TypeDirectory {
+			childMode |= 02000
+		} else if childMode&02010 == 02010 && ctx.Uid() != 0 {
+			if !containsGid(ctx, parentGid) {
+				childMode &= ^uint16(02000)
+			}
+		}
+		return childMode
+	}
+	return childMode
+}
+
 func (m *baseMeta) Mknod(ctx Context, parent Ino, name string, _type uint8, mode, cumask uint16, rdev uint32, path string, inode *Ino, attr *Attr) syscall.Errno {
 	if _type < TypeFile || _type > TypeSocket {
 		return syscall.EINVAL
@@ -1475,10 +1605,10 @@ func (m *baseMeta) Mknod(ctx Context, parent Ino, name string, _type uint8, mode
 	defer m.timeit("Mknod", time.Now())
 	parent = m.checkRoot(parent)
 	var space, inodes int64 = align4K(0), 1
-	if err := m.checkQuota(ctx, space, inodes, ctx.Uid(), ctx.Gid(), parent); err != 0 {
+	// check group quota in transaction
+	if err := m.checkQuota(ctx, space, inodes, ctx.Uid(), 0, parent); err != 0 {
 		return err
 	}
-
 	ino, err := m.nextInode()
 	if err != nil {
 		return errno(err)
@@ -1730,7 +1860,6 @@ func (m *baseMeta) BatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 	if st == 0 {
 		m.en.updateStats(r.space, r.inodes)
 		m.updateDirQuota(ctx, dstParent, r.space, r.inodes)
-		// TODO
 		for _, q := range r.deltas {
 			m.updateUserGroupStat(ctx, q.Uid, q.Gid, q.Space, q.Inodes)
 		}
@@ -1833,18 +1962,32 @@ func (m *baseMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 				}
 			}
 		}
-		if *tinode > 0 && flags != RenameExchange {
+		if *tinode > 0 {
 			diffLength = 0
 			if tattr.Typ == TypeDirectory {
 				m.parentMu.Lock()
-				delete(m.dirParents, *tinode)
+				if flags == RenameExchange {
+					if parentSrc != parentDst {
+						m.dirParents[*tinode] = parentSrc
+					}
+				} else {
+					delete(m.dirParents, *tinode)
+				}
 				m.parentMu.Unlock()
-			} else if attr.Typ == TypeFile {
-				diffLength = tattr.Length
+			} else if tattr.Typ == TypeFile {
+				diffLength = uint64(tattr.Length)
 			}
-			m.updateDirStat(ctx, parentDst, -int64(diffLength), -align4K(diffLength), -1)
-			if quotaDst > 0 {
-				m.updateDirQuota(ctx, parentDst, -align4K(diffLength), -1)
+			if parentSrc != parentDst || flags != RenameExchange {
+				m.updateDirStat(ctx, parentDst, -int64(diffLength), -align4K(diffLength), -1)
+				if quotaDst > 0 {
+					m.updateDirQuota(ctx, parentDst, -align4K(diffLength), -1)
+				}
+			}
+			if parentSrc != parentDst && flags == RenameExchange {
+				m.updateDirStat(ctx, parentSrc, int64(diffLength), align4K(diffLength), 1)
+				if quotaSrc > 0 {
+					m.updateDirQuota(ctx, parentSrc, align4K(diffLength), 1)
+				}
 			}
 		}
 	}
@@ -1973,7 +2116,11 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 	*slices = buildSlice(ss)
 	m.of.CacheChunk(inode, indx, *slices)
 	if !m.conf.ReadOnly && (len(ss) >= 5 || len(*slices) >= 5) {
-		go m.compactChunk(inode, indx, false, false)
+		tierID := -1
+		if f != nil {
+			tierID = int(f.attr.Tier)
+		}
+		go m.compactChunk(inode, indx, false, false, tierID)
 	}
 	return 0
 }
@@ -2026,9 +2173,9 @@ func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice 
 		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
 		if numSlices%100 == 99 || numSlices > 350 {
 			if numSlices < maxSlices {
-				go m.compactChunk(inode, indx, false, false)
+				go m.compactChunk(inode, indx, false, false, int(attr.Tier))
 			} else {
-				m.compactChunk(inode, indx, true, false)
+				m.compactChunk(inode, indx, true, false, int(attr.Tier))
 			}
 		}
 	}
@@ -2342,6 +2489,28 @@ func (m *baseMeta) Check(ctx Context, fpath string, opt *CheckOpt) error {
 	nodeBar := progress.AddCountBar("Checked nodes", 0)
 
 	var hasError bool
+	var walkError bool
+	needSyncVolumeStat := fpath == "/" && opt.Repair && opt.SyncDirStat
+	seen := make(map[Ino]bool)
+	var volumeUsed, volumeInodes int64
+	recordStat := func(ino Ino, attr *Attr) {
+		if !needSyncVolumeStat || ino == RootInode || ino == TrashInode {
+			return
+		}
+		if attr.Typ != TypeDirectory {
+			if attr.Nlink > 1 {
+				if seen[ino] {
+					return
+				}
+				seen[ino] = true
+			}
+			volumeUsed += align4K(attr.Length)
+			volumeInodes += 1
+			return
+		}
+		volumeUsed += align4K(0)
+		volumeInodes += 1
+	}
 	type node struct {
 		inode Ino
 		path  string
@@ -2353,11 +2522,21 @@ func (m *baseMeta) Check(ctx Context, fpath string, opt *CheckOpt) error {
 		var count int64
 		if opt.Recursive {
 			if st := m.walk(ctx, inode, fpath, &attr, func(ctx Context, inode Ino, path string, attr *Attr) {
+				recordStat(inode, attr)
 				nodes <- &node{inode, path, attr}
 				atomic.AddInt64(&count, 1)
 			}); st != 0 {
-				hasError = true
+				walkError = true
 				logger.Errorf("Walk %s: %s", fpath, st)
+			}
+			if needSyncVolumeStat && m.getFormat().TrashDays > 0 {
+				trashAttr := Attr{Typ: TypeDirectory}
+				if st := m.walk(ctx, TrashInode, "/.trash", &trashAttr, func(_ Context, ino Ino, _ string, a *Attr) {
+					recordStat(ino, a)
+				}); st != 0 {
+					walkError = true
+					logger.Errorf("Walk /.trash: %s", st)
+				}
 			}
 		} else {
 			nodes <- &node{inode, fpath, &attr}
@@ -2508,13 +2687,13 @@ func (m *baseMeta) Check(ctx Context, fpath string, opt *CheckOpt) error {
 		}()
 	}
 	wg.Wait()
-	if fpath == "/" && opt.Repair && opt.Recursive && opt.SyncDirStat {
-		if err := m.syncVolumeStat(ctx); err != nil {
+	if needSyncVolumeStat && !walkError {
+		if err := m.syncVolumeStat(ctx, volumeUsed, volumeInodes); err != nil {
 			logger.Errorf("Sync used space: %s", err)
 			hasError = true
 		}
 	}
-	if hasError {
+	if hasError || walkError {
 		return errors.New("some errors occurred, please check the log of fsck")
 	}
 
@@ -2599,7 +2778,7 @@ func (m *baseMeta) CompactAll(ctx Context, threads int, bar *utils.Bar) syscall.
 		go func() {
 			for c := range ch {
 				logger.Debugf("Compacting chunk %d:%d (%d slices)", c.inode, c.indx, c.slices)
-				m.compactChunk(c.inode, c.indx, false, true)
+				m.compactChunk(c.inode, c.indx, false, true, -1)
 				bar.Increment()
 			}
 			wg.Done()
@@ -2616,7 +2795,7 @@ func (m *baseMeta) CompactAll(ctx Context, threads int, bar *utils.Bar) syscall.
 	return 0
 }
 
-func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool) {
+func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID int) {
 	// avoid too many or duplicated compaction
 	k := uint64(inode) + (uint64(indx) << 40)
 	m.Lock()
@@ -2677,7 +2856,14 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool) {
 		return
 	}
 	logger.Debugf("compact %d:%d: skipped %d slices (%d bytes) %d slices (%d bytes)", inode, indx, skipped, pos, len(compacted), size)
-	err := m.newMsg(CompactChunk, slices, id)
+	if tierID == -1 {
+		var attr Attr
+		if eno := m.GetAttr(Background(), inode, &attr); eno != 0 {
+			return
+		}
+		tierID = int(attr.Tier)
+	}
+	err := m.newMsg(CompactChunk, slices, id, uint8(tierID))
 	if err != nil {
 		if !strings.Contains(err.Error(), "not exist") && !strings.Contains(err.Error(), "not found") {
 			logger.Warnf("compact %d %d with %d slices: %s", inode, indx, len(compacted), err)
@@ -2713,7 +2899,7 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool) {
 		m.Lock()
 		delete(m.compacting, k)
 		m.Unlock()
-		m.compactChunk(inode, indx, once, force)
+		m.compactChunk(inode, indx, once, force, tierID)
 	}
 }
 
@@ -2723,7 +2909,6 @@ func (m *baseMeta) Compact(ctx Context, inode Ino, concurrency int, preFunc, pos
 		logger.Errorf("get attr error [inode %v]: %v", inode, st)
 		return st
 	}
-
 	var wg sync.WaitGroup
 	// compact
 	chunkChan := make(chan cchunk, 10000)
@@ -2732,7 +2917,7 @@ func (m *baseMeta) Compact(ctx Context, inode Ino, concurrency int, preFunc, pos
 		go func() {
 			defer wg.Done()
 			for c := range chunkChan {
-				m.compactChunk(c.inode, c.indx, false, true)
+				m.compactChunk(c.inode, c.indx, false, true, int(attr.Tier))
 				postFunc()
 				if ctx.Canceled() {
 					return
@@ -3014,41 +3199,28 @@ func (m *baseMeta) CleanupTrashBefore(ctx Context, edge time.Time, increProgress
 	return 0
 }
 
-func (m *baseMeta) scanTrashEntry(ctx Context, scan func(inode Ino, size uint64)) error {
-	var st syscall.Errno
-	var entries []*Entry
-	if st = m.en.doReaddir(ctx, TrashInode, 1, &entries, -1); st != 0 {
-		return errors.Wrap(st, "read trash")
-	}
-
-	var subEntries []*Entry
-	for _, entry := range entries {
-		scan(entry.Inode, entry.Attr.Length)
-		subEntries = subEntries[:0]
-		if st = m.en.doReaddir(ctx, entry.Inode, 1, &subEntries, -1); st != 0 {
-			logger.Warnf("readdir subEntry %d: %s", entry.Inode, st)
-			continue
-		}
-		for _, se := range subEntries {
-			scan(se.Inode, se.Attr.Length)
-		}
-	}
-	return nil
-}
-
 func (m *baseMeta) scanTrashFiles(ctx Context, scan trashFileScan) error {
 	var st syscall.Errno
 	var entries []*Entry
 	if st = m.en.doReaddir(ctx, TrashInode, 1, &entries, -1); st != 0 {
 		return errors.Wrap(st, "read trash")
 	}
-
 	var subEntries []*Entry
 	for _, entry := range entries {
 		ts, err := time.Parse("2006-01-02-15", string(entry.Name))
 		if err != nil {
 			logger.Warnf("bad entry as a subTrash: %s", entry.Name)
 			continue
+		}
+		if m.fmt.DirStats {
+			ds, st := m.GetDirStat(ctx, entry.Inode)
+			if st == 0 && ds != nil {
+				if _, err := scan(entry.Inode, uint64(ds.length), ts, ds.inodes); err != nil {
+					return errors.Wrap(err, "scan trash files")
+				}
+				continue
+			}
+			logger.Warnf("get dir stat %d: %s, fallback to readdir", entry.Inode, st)
 		}
 		subEntries = subEntries[:0]
 		if st = m.en.doReaddir(ctx, entry.Inode, 1, &subEntries, -1); st != 0 {
@@ -3057,7 +3229,7 @@ func (m *baseMeta) scanTrashFiles(ctx Context, scan trashFileScan) error {
 		}
 		for _, se := range subEntries {
 			if se.Attr.Typ == TypeFile {
-				clean, err := scan(se.Inode, se.Attr.Length, ts)
+				clean, err := scan(se.Inode, se.Attr.Length, ts, 1)
 				if err != nil {
 					return errors.Wrap(err, "scan trash files")
 				}
@@ -3326,36 +3498,8 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 
 		// Batch clone files immediately (don't wait for subdirs to finish)
 		if len(nonDirEntries) > 0 {
-			batchEno := m.BatchClone(cloneCtx, srcIno, ino, nonDirEntries, cmode, cumask, count)
-			if batchEno == syscall.ENOTSUP {
-				// Fallback: clone each file concurrently
-				for _, e := range nonDirEntries {
-					select {
-					case concurrent <- struct{}{}:
-						entry := e
-						g.Go(func() error {
-							defer func() { <-concurrent }()
-							if childEno := cloneChild(entry); childEno != 0 {
-								return childEno
-							}
-							return nil
-						})
-					default:
-						// Synchronous fallback when concurrency limit reached
-						if childEno := cloneChild(e); childEno != 0 && eno == 0 {
-							eno = childEno
-						}
-					}
-
-					if cloneCtx.Canceled() {
-						break
-					}
-				}
-				if eno == syscall.ENOTSUP {
-					eno = 0
-				}
-			} else if batchEno != 0 {
-				eno = batchEno
+			eno = m.BatchClone(cloneCtx, srcIno, ino, nonDirEntries, cmode, cumask, count)
+			if eno != 0 {
 				break
 			}
 		}
@@ -3414,7 +3558,7 @@ func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr
 	}
 	if set&SetAttrMode != 0 {
 		if ctx.Uid() != 0 && (attr.Mode&02000) != 0 {
-			if ctx.Gid() != cur.Gid {
+			if !containsGid(ctx, cur.Gid) {
 				attr.Mode &= 05777
 			}
 		}
@@ -3470,6 +3614,10 @@ func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr
 	}
 	if set&SetAttrFlag != 0 {
 		dirtyAttr.Flags = attr.Flags
+		changed = true
+	}
+	if set&SetAttrTier != 0 {
+		dirtyAttr.Tier = attr.Tier
 		changed = true
 	}
 	if !changed {

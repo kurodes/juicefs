@@ -65,6 +65,7 @@ func Main(args []string) error {
 			cmdFsck(),
 			cmdRestore(),
 			cmdDump(),
+			cmdChangelog(),
 			cmdLoad(),
 			cmdVersion(),
 			cmdStatus(),
@@ -85,6 +86,7 @@ func Main(args []string) error {
 			cmdClone(),
 			cmdSummary(),
 			cmdCompact(),
+			cmdTier(),
 		},
 	}
 
@@ -221,7 +223,7 @@ func reorderOptions(app *cli.App, args []string) []string {
 			if hasValue {
 				i++
 				if i >= len(args) {
-					logger.Fatalf("option %s requires value", option)
+					logger.Fatalf("option %q requires value", option)
 				}
 				newArgs = append(newArgs, args[i])
 			}
@@ -260,7 +262,7 @@ func reorderOptions(app *cli.App, args []string) []string {
 			}
 		} else {
 			if strings.HasPrefix(option, "-") && !utils.StringContains(args, "--generate-bash-completion") {
-				logger.Fatalf("unknown option: %s", option)
+				logger.Fatalf("unknown option: %q", option)
 			}
 			others = append(others, option)
 		}
