@@ -3686,7 +3686,7 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 
 	return errno(m.txn(ctx, func(tx *kvTxn) error {
 		now := time.Now()
-		*result = batchCloneResult{deltas: make(ugQuotaDeltas)}
+		*result = batchCloneResult{}
 
 		// validate destination parent
 		pa := tx.get(m.inodeKey(dstParent))
@@ -3797,12 +3797,6 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 			}
 			result.space += entrySpace
 			result.inodes++
-			result.deltas.add(&ugQuotaDelta{
-				Uid:    attr.Uid,
-				Gid:    attr.Gid,
-				Space:  entrySpace,
-				Inodes: 1,
-			})
 		}
 
 		// copy file chunks and update slice refs

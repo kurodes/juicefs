@@ -179,39 +179,10 @@ type symlinkCache struct {
 	cap  int32
 }
 
-// userGroupQuotaDelta represents quota changes for a specific user and group.
-type userGroupQuotaDelta struct {
-	Uid    uint32
-	Gid    uint32
-	Space  int64
-	Inodes int64
-}
-
 type batchCloneResult struct {
-	length          int64
-	space           int64
-	inodes          int64
-	userGroupQuotas []userGroupQuotaDelta
-}
-
-func appendUGQuotaDelta(userGroupQuotas *[]userGroupQuotaDelta, parent Ino, uid, gid uint32, nlink uint32, typ uint8, length uint64) {
-	if userGroupQuotas == nil || parent.IsTrash() {
-		return
-	}
-	var entrySpace int64
-	if nlink == 0 {
-		if typ == TypeFile {
-			entrySpace = -align4K(length)
-		} else {
-			entrySpace = -align4K(0)
-		}
-	}
-	*userGroupQuotas = append(*userGroupQuotas, userGroupQuotaDelta{
-		Uid:    uid,
-		Gid:    gid,
-		Space:  entrySpace,
-		Inodes: -1,
-	})
+	length int64
+	space  int64
+	inodes int64
 }
 
 func newSymlinkCache(cap int32) *symlinkCache {
@@ -1459,9 +1430,6 @@ func (m *baseMeta) BatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 	if st == 0 {
 		m.en.updateStats(r.space, r.inodes)
 		m.updateDirQuota(ctx, dstParent, r.space, r.inodes)
-		for _, q := range r.userGroupQuotas {
-			m.updateUserGroupQuota(ctx, q.Uid, q.Gid, q.Space, q.Inodes)
-		}
 		if count != nil {
 			atomic.AddUint64(count, uint64(r.inodes))
 		}

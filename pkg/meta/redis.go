@@ -4476,7 +4476,7 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 		return 0
 	}
 	if result != nil {
-		*result = batchCloneResult{deltas: make(ugQuotaDeltas)}
+		*result = batchCloneResult{}
 	}
 
 	const batchSize = 1000
@@ -4666,7 +4666,7 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 				}
 			}
 
-			batchResult = batchCloneResult{deltas: make(ugQuotaDeltas)}
+			batchResult = batchCloneResult{}
 			refDelta := make(map[string]int64)
 			validInfos := make([]*cloneInfo, 0, len(infos))
 			for _, info := range infos {
@@ -4698,12 +4698,6 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 				entrySpace := align4K(sd.attr.Length)
 				batchResult.space += entrySpace
 				batchResult.inodes++
-				batchResult.deltas.add(&ugQuotaDelta{
-					Uid:    info.dstAttr.Uid,
-					Gid:    info.dstAttr.Gid,
-					Space:  entrySpace,
-					Inodes: 1,
-				})
 
 				if info.dstAttr.Typ == TypeFile {
 					for _, chunk := range sd.chunks {
@@ -4763,9 +4757,6 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 			result.length += batchResult.length
 			result.space += batchResult.space
 			result.inodes += batchResult.inodes
-			for _, q := range batchResult.deltas {
-				result.deltas.add(q)
-			}
 		}
 	}
 	return 0

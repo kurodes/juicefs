@@ -4631,7 +4631,7 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 
 	err := m.txn(func(s *xorm.Session) error {
 		nowNano := time.Now().UnixNano()
-		*result = batchCloneResult{userGroupQuotas: make([]userGroupQuotaDelta, 0, len(entries))}
+		*result = batchCloneResult{}
 
 		if _, err := m.validateCloneTarget(ctx, s, dstParent); err != nil {
 			return err
@@ -4704,10 +4704,6 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 			}
 			result.space += entrySpace
 			result.inodes++
-			result.userGroupQuotas = append(result.userGroupQuotas, userGroupQuotaDelta{
-				Uid: info.dstNode.Uid, Gid: info.dstNode.Gid,
-				Space: entrySpace, Inodes: 1,
-			})
 		}
 
 		if err := mustInsert(s, nodesIns...); err != nil {
