@@ -750,8 +750,6 @@ func doUploadPart(src, dst object.ObjectStorage, srckey string, off, size int64,
 	}
 	start := time.Now()
 	sz := size
-	data := dynAlloc(int(size))
-	defer dynFree(data)
 	var part *object.Part
 	var chksum uint32
 	err := try(3, func() error {
@@ -761,12 +759,21 @@ func doUploadPart(src, dst object.ObjectStorage, srckey string, off, size int64,
 		}
 		defer in.Close()
 		r := &chksumReader{in, 0, calChksum}
-		if _, err = io.ReadFull(r, data); err != nil {
-			return err
+		err = utils.ErrNotSUP
+		if obj, ok := dst.(object.SupportUploadPartStream); ok {
+			part, err = obj.UploadPartStream(key, uploadID, num+1, r)
+		}
+
+		if errors.Is(err, utils.ErrNotSUP) {
+			data := dynAlloc(int(size))
+			defer dynFree(data)
+			if _, err = io.ReadFull(r, data); err != nil {
+				return err
+			}
+			// PartNumber starts from 1
+			part, err = dst.UploadPart(ctx, key, uploadID, num+1, data)
 		}
 		chksum = r.chksum
-		// PartNumber starts from 1
-		part, err = dst.UploadPart(ctx, key, uploadID, num+1, data)
 		return err
 	})
 	if err != nil {
@@ -774,7 +781,6 @@ func doUploadPart(src, dst object.ObjectStorage, srckey string, off, size int64,
 		return nil, 0, fmt.Errorf("part %d: %s", num, err)
 	}
 	logger.Debugf("Copied data of %s part %d in %s", key, num, time.Since(start))
-	copiedBytes.IncrInt64(sz)
 	return part, chksum, nil
 }
 
@@ -903,8 +909,11 @@ func doCopyMultiple(src, dst object.ObjectStorage, key string, size int64, mtime
 			var chksum uint32
 			parts[num], chksum, copyErr = doCopyRange(src, dst, key, int64(num)*partSize, sz, upload, num, abort, calChksum)
 			chksums[num] = chksumWithSz{chksum, sz}
-			if copyErr == nil && state != nil {
-				uploads.MarkMultipartPart(key, state, parts[num], chksum, calChksum)
+			if copyErr == nil {
+				copiedBytes.IncrInt64(sz)
+				if state != nil {
+					uploads.MarkMultipartPart(key, state, parts[num], chksum, calChksum)
+				}
 			}
 			errs <- copyErr
 		}(i)
@@ -960,7 +969,7 @@ func copyData(src, dst object.ObjectStorage, key string, size int64, mtime time.
 	if size <= multipartCheckpointThreshold {
 		uploads = nil
 	}
-	if size < maxBlock {
+	if size < max(int64(dst.Limits().MinPartSize*2), maxBlock) {
 		err = try(3, func() (err error) {
 			srcChksum, err = doCopySingle(src, dst, key, size, calChksum)
 			return
@@ -1122,7 +1131,7 @@ func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Con
 
 			if config.Links && obj.IsSymlink() {
 				if err = copyLink(src, dst, key); err != nil {
-					logger.Errorf("copy link failed: %s", err)
+					logger.Errorf("copy link %s failed: %s", key, err)
 				}
 			} else {
 				srcChksum, err = copyData(src, dst, key, obj.Size(), obj.Mtime(), config.CheckAll || config.CheckNew, uploads)
@@ -1210,16 +1219,30 @@ func checkChange(src, dst object.ObjectStorage, obj object.Object, key string, c
 }
 
 func copyLink(src object.ObjectStorage, dst object.ObjectStorage, key string) error {
-	if p, err := src.(object.SupportSymlink).Readlink(key); err != nil {
+	var p string
+	var err error
+	if p, err = src.(object.SupportSymlink).Readlink(key); err != nil {
 		return err
-	} else {
-		if err := dst.Delete(ctx, key); err != nil {
-			logger.Debugf("Deleted %s from %s ", key, dst)
-			return err
-		}
-		// TODO: use relative path based on option
-		return dst.(object.SupportSymlink).Symlink(p, key)
 	}
+	return try(3, func() (err error) {
+		// TODO: use relative path based on option
+		if err := dst.(object.SupportSymlink).Symlink(p, key); err != nil {
+			if info, err := dst.Head(ctx, key); err == nil && info.IsSymlink() {
+				if cPath, err2 := dst.(object.SupportSymlink).Readlink(key); err2 == nil && p == cPath {
+					return nil
+				}
+			}
+			if err := dst.Delete(ctx, key); err != nil {
+				logger.Errorf("delete %s from %s failed: %s", key, dst, err)
+				return err
+			}
+			if err := dst.(object.SupportSymlink).Symlink(p, key); err != nil {
+				logger.Warnf("symlink %s to %s error %s", p, key, err)
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 type objWithSize struct {
@@ -1303,14 +1326,16 @@ func handleExtraObject(tasks chan<- object.Object, dstobj object.Object, config 
 	if checkpointMgr.isCheckpointKey(dstobj.Key()) {
 		return false
 	}
-	incrTotal(1)
-	if !config.DeleteDst || !config.Dirs && dstobj.IsDir() || config.Limit == 0 {
+	if config.Limit == 0 {
+		return true
+	}
+	if !config.DeleteDst || !config.Dirs && dstobj.IsDir() {
 		logger.Debug("Ignore extra object", dstobj.Key())
 		extra.Increment()
 		extraBytes.IncrInt64(dstobj.Size())
 		return false
 	}
-	config.Limit--
+	incrTotal(1)
 	if dstobj.IsDir() {
 		dstDelayDelMu.Lock()
 		dstDelayDel = append(dstDelayDel, dstobj.Key())
@@ -1321,6 +1346,9 @@ func handleExtraObject(tasks chan<- object.Object, dstobj object.Object, config 
 			checkpointMgr.AddPendingKey(prefix, obj)
 		}
 		tasks <- obj
+	}
+	if config.Limit > 0 {
+		config.Limit--
 	}
 	return config.Limit == 0
 }
@@ -1408,13 +1436,6 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 			logger.Debug("Ignore directory ", obj.Key())
 			continue
 		}
-		if config.Limit >= 0 {
-			if config.Limit == 0 {
-				return nil
-			}
-			config.Limit--
-		}
-		incrTotal(1)
 
 		if dstobj != nil && obj.Key() > dstobj.Key() {
 			if handleExtraObject(tasks, dstobj, config, checkpointMgr, prefix) {
@@ -1437,6 +1458,13 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 			}
 		}
 
+		if config.Limit >= 0 {
+			if config.Limit == 0 {
+				return nil
+			}
+			config.Limit--
+		}
+		incrTotal(1)
 		// FIXME: there is a race when source is modified during coping
 		if dstobj == nil || obj.Key() < dstobj.Key() {
 			if config.Existing {
@@ -2207,23 +2235,25 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 			if failed != nil {
 				msg += fmt.Sprintf(", failed: %d", failed.Current())
 			}
-			if total-handled.Current()-extra.Current() > 0 {
-				msg += fmt.Sprintf(", lost: %d", total-handled.Current()-extra.Current())
+			if total-handled.Current() > 0 {
+				msg += fmt.Sprintf(", lost: %d", total-handled.Current())
 			}
 			logger.Info(msg)
 
 			if failed != nil {
-				if n := failed.Current(); n > 0 || total > handled.Current()+extra.Current() {
+				if n := failed.Current(); n > 0 || total > handled.Current() {
 					if checkpointMgr != nil {
 						if e := checkpointMgr.Save(checkpointMgr.checkpoint); e != nil {
 							logger.Warnf("Failed to save checkpoint after failure: %v", e)
 						}
 					}
-					return fmt.Errorf("failed to handle %d objects", n+total-handled.Current()-extra.Current())
+					return fmt.Errorf("failed to handle %d objects", n+total-handled.Current())
 				}
 			}
-			if checkpointMgr != nil {
-				if e := checkpointMgr.DeleteCheckpoint(); e != nil {
+			if checkpointMgr != nil && !config.Dry {
+				if e := try(3, func() error {
+					return checkpointMgr.DeleteCheckpoint()
+				}); e != nil {
 					logger.Warnf("Failed to delete checkpoint after completion: %v", e)
 				}
 			}
@@ -2341,9 +2371,6 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		}()
 		delWg.Add(1)
 		go func() {
-			if checkpointMgr != nil && config.DeleteDst {
-				dstDelayDel = append(dstDelayDel, checkpointMgr.checkpointKey)
-			}
 			delayDelFunc(dst, dstDelayDel)
 			delWg.Done()
 		}()

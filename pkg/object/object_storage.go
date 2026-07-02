@@ -18,7 +18,6 @@ package object
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
@@ -47,6 +46,10 @@ type SupportSymlink interface {
 	Symlink(oldName, newName string) error
 	// Readlink read a symbolic link
 	Readlink(name string) (string, error)
+}
+
+type SupportUploadPartStream interface {
+	UploadPartStream(key string, uploadID string, num int, in io.Reader) (*Part, error)
 }
 
 type File interface {
@@ -121,7 +124,7 @@ func (s DefaultObjectStorage) Limits() Limits {
 	return Limits{IsSupportMultipartUpload: false, IsSupportUploadPartCopy: false}
 }
 
-func (s DefaultObjectStorage) Head(key string) (Object, error) {
+func (s DefaultObjectStorage) Head(ctx context.Context, key string) (Object, error) {
 	return nil, notSupported
 }
 
@@ -159,7 +162,7 @@ func (s DefaultObjectStorage) ListAll(ctx context.Context, prefix, marker string
 	return nil, notSupported
 }
 
-func (s DefaultObjectStorage) Restore(ctx context.Context, key string) error {
+func (s DefaultObjectStorage) Restore(ctx context.Context, key string, days int32) error {
 	return notSupported
 }
 
@@ -169,6 +172,11 @@ var storages = make(map[string]Creator)
 
 func Register(name string, register Creator) {
 	storages[name] = register
+}
+
+func IsSupported(name string) bool {
+	_, ok := storages[name]
+	return ok
 }
 
 func CreateStorage(name, endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {
@@ -336,90 +344,81 @@ func TmpFilePath(parent, name string) string {
 
 type TierKey struct{}
 
-const defaultRestoreDays = 3
+const DefaultRestoreDays = 3
 
 type SupportTier interface {
-	SetTier(init Tiers)
-	GetStorageClass(ctx context.Context) string
+	InitTiers(init Tiers) error
+	GetTier(ctx context.Context) Tier
 }
 
 type tierStorage struct {
-	sc    string
 	tiers map[uint8]Tier
 }
 
-func (b *tierStorage) GetStorageClass(ctx context.Context) string {
-	sc := b.sc
+func (b *tierStorage) GetTier(ctx context.Context) Tier {
 	if id, ok := ctx.Value(TierKey{}).(uint8); ok {
 		if t, ok := b.tiers[id]; ok {
-			sc = t.Sc
-		} else {
-			logger.Warnf("invalid tier id: %d", id)
+			return t
 		}
+		logger.Warnf("invalid tier id: %d", id)
 	}
-	return sc
+	return b.tiers[0]
 }
 
-func (b *tierStorage) SetTier(init Tiers) {
+func (b *tierStorage) InitTiers(init Tiers) error {
 	if init == nil {
-		init = Tiers{}
+		init = NewTiers("")
+	}
+	for id, t := range init {
+		if t.Tag != "" && !ValidateTag(t.Tag) {
+			logger.Warnf("invalid tag %q for tier %d; ignore it", t.Tag, id)
+			t.encodedTag = ""
+		} else {
+			t.encodedTag = encodeTag(t.Tag)
+		}
+		init[id] = t
 	}
 	b.tiers = init
-}
-
-type Tier struct {
-	ID uint8  `json:"ID"`
-	Sc string `json:"StorageClass"`
-}
-
-func (t Tier) GetHumanSc() string {
-	if t.ID == 0 {
-		return "default"
-	}
-	return t.Sc
-}
-
-type tierAlias Tier
-
-func (t *Tier) UnmarshalJSON(data []byte) error {
-	var aux tierAlias
-	if err := json.Unmarshal(data, &aux); err != nil {
-		return err
-	}
-	if aux.ID == 0 {
-		aux.Sc = ""
-	}
-	*t = Tier(aux)
 	return nil
 }
 
-func (t Tier) MarshalJSON() ([]byte, error) {
-	aux := tierAlias(t)
-	if aux.ID == 0 {
-		aux.Sc = "default"
+func encodeTag(tag string) string {
+	if tag == "" || !ValidateTag(tag) {
+		return ""
 	}
-	return json.Marshal(aux)
+	parts := strings.SplitN(tag, "=", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	return url.QueryEscape(parts[0]) + "=" + url.QueryEscape(parts[1])
+}
+
+type Tier struct {
+	ID         uint8  `json:"ID"`
+	Sc         string `json:"StorageClass"`
+	Tag        string `json:"Tag"`
+	encodedTag string
+}
+
+func ValidateTag(tag string) bool {
+	if tag == "" {
+		return true
+	}
+	if strings.Count(tag, "=") != 1 {
+		return false
+	}
+	parts := strings.SplitN(tag, "=", 2)
+	return parts[0] != "" && parts[1] != ""
 }
 
 type Tiers map[uint8]Tier
 
-func (t Tiers) GetID(sc string) (uint8, bool) {
-	for k, v := range t {
-		if v.Sc == sc {
-			return k, true
-		}
-	}
-	return 0, false
-}
-
-func (t Tiers) GetSc(id uint8) (string, bool) {
-	tInfo, ok := t[id]
-	return tInfo.Sc, ok
-}
-
-func NewTiers() Tiers {
+func NewTiers(defaultSc string) Tiers {
 	t := make(Tiers)
-	t[0] = Tier{}
+	t[0] = Tier{
+		ID: 0,
+		Sc: defaultSc,
+	}
 	return t
 }
 

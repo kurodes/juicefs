@@ -54,9 +54,10 @@ func (s *ibmcos) String() string {
 func (s *ibmcos) Create(ctx context.Context) error {
 	input := &s3.CreateBucketInput{Bucket: &s.bucket}
 	// https://cloud.ibm.com/docs/cloud-object-storage?topic=cloud-object-storage-classes&code=go
-	if s.sc != "" {
+
+	if sc := s.tiers[0].Sc; sc != "" {
 		input.CreateBucketConfiguration = &s3.CreateBucketConfiguration{
-			LocationConstraint: &s.sc,
+			LocationConstraint: &sc,
 		}
 	}
 	_, err := s.s3.CreateBucket(input)
@@ -99,17 +100,17 @@ func (s *ibmcos) Get(ctx context.Context, key string, off, limit int64, getters 
 	return resp.Body, nil
 }
 
-func (s *ibmcos) Restore(ctx context.Context, key string) error {
+func (s *ibmcos) Restore(ctx context.Context, key string, days int32) error {
 	_, err := s.s3.RestoreObject(&s3.RestoreObjectInput{
 		Bucket:         aws.String(s.bucket),
 		Key:            aws.String(key),
-		RestoreRequest: &s3.RestoreRequest{Days: aws.Int64(defaultRestoreDays)},
+		RestoreRequest: &s3.RestoreRequest{Days: aws.Int64(int64(days))},
 	})
 	return err
 }
 
 func (s *ibmcos) Put(ctx context.Context, key string, in io.Reader, getters ...AttrGetter) error {
-	sc := s.GetStorageClass(ctx)
+	t := s.GetTier(ctx)
 	var body io.ReadSeeker
 	if b, ok := in.(io.ReadSeeker); ok {
 		body = b
@@ -127,18 +128,22 @@ func (s *ibmcos) Put(ctx context.Context, key string, in io.Reader, getters ...A
 		Body:        body,
 		ContentType: &mimeType,
 	}
-	if sc != "" {
-		params.SetStorageClass(sc)
+	if t.Sc != "" {
+		params.SetStorageClass(t.Sc)
+	}
+	if t.encodedTag != "" {
+		params.Tagging = aws.String(t.encodedTag)
 	}
 	var reqID string
 	_, err := s.s3.PutObjectWithContext(ctx, params, request.WithGetResponseHeader(s3RequestIDKey, &reqID))
 	attrs := ApplyGetters(getters...)
-	attrs.SetRequestID(reqID).SetStorageClass(sc)
+	attrs.SetRequestID(reqID).SetStorageClass(t.Sc)
 	return err
 }
 
 func (s *ibmcos) Copy(ctx context.Context, dst, src string) error {
-	sc := getOrDefaultScValue(s.GetStorageClass(ctx), DefaultStorageClass)
+	t := s.GetTier(ctx)
+	sc := getOrDefaultScValue(t.Sc, DefaultStorageClass)
 	src = s.bucket + "/" + src
 	params := &s3.CopyObjectInput{
 		Bucket:     &s.bucket,
@@ -146,6 +151,10 @@ func (s *ibmcos) Copy(ctx context.Context, dst, src string) error {
 		CopySource: &src,
 	}
 	params.SetStorageClass(sc)
+	if t.encodedTag != "" {
+		params.SetTaggingDirective(s3.TaggingDirectiveReplace)
+		params.SetTagging(t.encodedTag)
+	}
 	_, err := s.s3.CopyObjectWithContext(ctx, params)
 	return err
 }
@@ -164,11 +173,11 @@ func (s *ibmcos) Head(ctx context.Context, key string) (Object, error) {
 	}
 	return &obj{
 		key,
-		*r.ContentLength,
-		*r.LastModified,
+		aws.Int64Value(r.ContentLength),
+		aws.TimeValue(r.LastModified),
 		strings.HasSuffix(key, "/"),
-		*r.StorageClass,
-		*r.Restore,
+		aws.StringValue(r.StorageClass),
+		aws.StringValue(r.Restore),
 	}, nil
 }
 
@@ -203,23 +212,32 @@ func (s *ibmcos) List(ctx context.Context, prefix, start, token, delimiter strin
 	objs := make([]Object, n)
 	for i := 0; i < n; i++ {
 		o := resp.Contents[i]
-		oKey, err := decodeKey(*o.Key, resp.EncodingType)
+		rawKey := aws.StringValue(o.Key)
+		oKey, err := decodeKey(rawKey, resp.EncodingType)
 		if err != nil {
-			return nil, false, "", errors.WithMessagef(err, "failed to decode key %s", *o.Key)
+			return nil, false, "", errors.WithMessagef(err, "failed to decode key %s", rawKey)
 		}
-		objs[i] = &obj{oKey, *o.Size, *o.LastModified, strings.HasSuffix(oKey, "/"), *o.StorageClass, ""}
+		objs[i] = &obj{
+			oKey,
+			aws.Int64Value(o.Size),
+			aws.TimeValue(o.LastModified),
+			strings.HasSuffix(oKey, "/"),
+			aws.StringValue(o.StorageClass),
+			"",
+		}
 	}
 	if delimiter != "" {
 		for _, p := range resp.CommonPrefixes {
-			prefix, err := decodeKey(*p.Prefix, resp.EncodingType)
+			rawPrefix := aws.StringValue(p.Prefix)
+			prefix, err := decodeKey(rawPrefix, resp.EncodingType)
 			if err != nil {
-				return nil, false, "", errors.WithMessagef(err, "failed to decode commonPrefixes %s", *p.Prefix)
+				return nil, false, "", errors.WithMessagef(err, "failed to decode commonPrefixes %s", rawPrefix)
 			}
 			objs = append(objs, &obj{prefix, 0, time.Unix(0, 0), true, "", ""})
 		}
 		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
 	}
-	return objs, *resp.IsTruncated, *resp.NextMarker, nil
+	return objs, aws.BoolValue(resp.IsTruncated), aws.StringValue(resp.NextMarker), nil
 }
 
 func (s *ibmcos) ListAll(ctx context.Context, prefix, marker string, followLink bool) (<-chan Object, error) {
@@ -231,14 +249,18 @@ func (s *ibmcos) CreateMultipartUpload(ctx context.Context, key string) (*Multip
 		Bucket: &s.bucket,
 		Key:    &key,
 	}
-	if s.sc != "" {
-		params.SetStorageClass(s.sc)
+	if s.tiers[0].Sc != "" {
+		params.SetStorageClass(s.tiers[0].Sc)
 	}
 	resp, err := s.s3.CreateMultipartUploadWithContext(ctx, params)
 	if err != nil {
 		return nil, err
 	}
-	return &MultipartUpload{UploadID: *resp.UploadId, MinPartSize: 5 << 20, MaxCount: 10000}, nil
+	uploadID := aws.StringValue(resp.UploadId)
+	if uploadID == "" {
+		return nil, fmt.Errorf("ibmcos: CreateMultipartUpload returned empty UploadId for %s", key)
+	}
+	return &MultipartUpload{UploadID: uploadID, MinPartSize: 5 << 20, MaxCount: 10000}, nil
 }
 
 func (s *ibmcos) UploadPart(ctx context.Context, key string, uploadID string, num int, body []byte) (*Part, error) {
@@ -254,7 +276,7 @@ func (s *ibmcos) UploadPart(ctx context.Context, key string, uploadID string, nu
 	if err != nil {
 		return nil, err
 	}
-	return &Part{Num: num, ETag: *resp.ETag}, nil
+	return &Part{Num: num, ETag: aws.StringValue(resp.ETag)}, nil
 }
 
 func (s *ibmcos) UploadPartCopy(ctx context.Context, key string, uploadID string, num int, srcKey string, off, size int64) (*Part, error) {
@@ -299,18 +321,9 @@ func (s *ibmcos) ListUploads(ctx context.Context, marker string) ([]*PendingPart
 	}
 	parts := make([]*PendingPart, len(result.Uploads))
 	for i, u := range result.Uploads {
-		parts[i] = &PendingPart{*u.Key, *u.UploadId, *u.Initiated}
+		parts[i] = &PendingPart{aws.StringValue(u.Key), aws.StringValue(u.UploadId), aws.TimeValue(u.Initiated)}
 	}
-	var nextMarker string
-	if result.NextKeyMarker != nil {
-		nextMarker = *result.NextKeyMarker
-	}
-	return parts, nextMarker, nil
-}
-
-func (s *ibmcos) SetStorageClass(sc string) error {
-	s.sc = sc
-	return nil
+	return parts, aws.StringValue(result.NextKeyMarker), nil
 }
 
 func newIBMCOS(endpoint, apiKey, serviceInstanceID, token string) (ObjectStorage, error) {

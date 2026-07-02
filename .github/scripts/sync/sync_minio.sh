@@ -158,6 +158,66 @@ wait_gateway_ready(){
     fi
 }
 
+create_sparse_marker_file(){
+    local file_path=$1
+    local file_size=$2
+    python3 - "$file_path" "$file_size" <<'PY'
+import sys
+
+path = sys.argv[1]
+size = int(sys.argv[2])
+markers = [
+    (0, b"juicefs-multipart-checkpoint-begin\n"),
+    (size // 2, b"juicefs-multipart-checkpoint-middle\n"),
+    (size - len(b"juicefs-multipart-checkpoint-end\n"), b"juicefs-multipart-checkpoint-end\n"),
+]
+
+with open(path, "wb") as f:
+    f.truncate(size)
+    for offset, data in markers:
+        f.seek(offset)
+        f.write(data)
+PY
+}
+
+assert_checkpoint_contains_multipart_state(){
+    local checkpoint_file=$1
+    local object_key=$2
+    local expected_size=$3
+    python3 - "$checkpoint_file" "$object_key" "$expected_size" <<'PY'
+import json
+import sys
+
+checkpoint_file, object_key, expected_size = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with open(checkpoint_file, "r", encoding="utf-8") as f:
+    checkpoint = json.load(f)
+
+uploads = checkpoint.get("multipart_uploads") or {}
+state = uploads.get(object_key)
+if not state:
+    raise SystemExit(f"missing multipart checkpoint for {object_key}")
+
+upload = state.get("upload") or {}
+upload_id = upload.get("UploadID")
+if not upload_id:
+    raise SystemExit(f"missing upload id for {object_key}")
+
+if state.get("size") != expected_size:
+    raise SystemExit(f"unexpected checkpoint size: {state.get('size')} != {expected_size}")
+
+parts = state.get("parts") or {}
+if not parts:
+    raise SystemExit(f"missing uploaded parts for {object_key}")
+
+print(upload_id)
+PY
+}
+
+get_minio_object_size(){
+    local target=$1
+    ./mc stat --json "$target" | python3 -c 'import json, sys; payload = json.load(sys.stdin); size = payload.get("size"); metadata = payload.get("metadata") or {}; size = metadata.get("content-length") if size is None else size; assert size is not None, "unable to get object size from mc stat output"; print(int(size))'
+}
+
 # ---- sync encryption / decryption tests (minio) ----
 
 setup_sync_encrypt_keys(){
@@ -501,6 +561,56 @@ test_checkpoint_minio_big_file_resume(){
     rm -f /tmp/bigfile_ckpt /tmp/bigfile_ckpt2
 }
 
+test_checkpoint_minio_multipart_resume(){
+    # Test: multipart upload checkpoint should persist upload state and resume for >4GiB objects
+    prepare_test
+    local key="multipart-checkpoint.bin"
+    local size=$((5 * 1024 * 1024 * 1024 + 17 * 1024 * 1024))
+    local checkpoint_json=/tmp/minio-multipart-checkpoint.json
+    rm -f "$checkpoint_json"
+    create_sparse_marker_file "/jfs/$key" "$size"
+
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9005/myjfs/ minio://minioadmin:minioadmin@localhost:9000/myjfs/ \
+        --threads 1 --list-threads 1 --debug \
+        --enable-checkpoint --checkpoint-interval 60s \
+        >sync1.log 2>&1 &
+    sync_pid=$!
+    sleep 4
+    kill -INT $sync_pid || true
+    wait $sync_pid || true
+
+    checkpoint_file=$(./mc find myminio/myjfs/ --name ".juicefs-sync-checkpoint*" 2>/dev/null | head -1)
+    if [ -z "$checkpoint_file" ]; then
+        echo "checkpoint file should exist after interrupted multipart minio sync"
+        cat sync1.log
+        exit 1
+    fi
+
+    ./mc cat "$checkpoint_file" > "$checkpoint_json"
+    upload_id=$(assert_checkpoint_contains_multipart_state "$checkpoint_json" "$key" "$size")
+    [ -n "$upload_id" ] || (echo "multipart upload id should not be empty" && exit 1)
+
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9005/myjfs/ minio://minioadmin:minioadmin@localhost:9000/myjfs/ \
+        --threads 1 --list-threads 1 --debug \
+        --enable-checkpoint --checkpoint-interval 2s \
+        >sync2.log 2>&1
+
+    checkpoint_count=$(./mc find myminio/myjfs/ --name ".juicefs-sync-checkpoint*" 2>/dev/null | wc -l)
+    if [ "$checkpoint_count" -ne 0 ]; then
+        echo "checkpoint file should be deleted after multipart minio sync resumes successfully"
+        cat sync2.log
+        exit 1
+    fi
+
+    dst_size=$(get_minio_object_size "myminio/myjfs/$key")
+    if [ "$dst_size" -ne "$size" ]; then
+        echo "multipart minio object size mismatch: $dst_size vs $size"
+        exit 1
+    fi
+
+    grep "panic:\|<FATAL>" sync2.log && echo "panic or fatal in sync2.log" && exit 1 || true
+}
+
 test_checkpoint_minio_signal_save(){
     # Test: SIGINT saves checkpoint for minio sync
     prepare_test
@@ -528,6 +638,182 @@ test_checkpoint_minio_signal_save(){
     count1=$(./mc ls -r juicegw/myjfs/ | grep -v ".juicefs-sync-checkpoint" | wc -l)
     count2=$(./mc ls -r myminio/myjfs/ | grep -v ".juicefs-sync-checkpoint" | wc -l)
     [ $count1 -eq $count2 ] || (echo "file count mismatch after resume: $count1 vs $count2" && exit 1)
+}
+
+test_sync_multipart_stream_various_sizes(){
+    prepare_test
+    local part=$((5 * 1024 * 1024))  # 5MiB default part size
+    local sizes=(
+        $((part - 1))       # 5MiB-1  - single part
+        $((part + 1))       # 5MiB+1  - triggers 2 parts
+        $((part * 2))       # 10MiB   - 2 parts
+        $((part * 2 + 17))  # 10MiB+17 - odd-size 2 parts
+        $((part * 3 - 1))   # 15MiB-1 - 3 parts (tests non-aligned)
+    )
+
+    mkdir -p /jfs/stream_sizes
+    for size in "${sizes[@]}"; do
+        local filename="file_${size}"
+        # Write 4KiB random header then truncate to target size
+        dd if=/dev/urandom of="/jfs/stream_sizes/$filename" bs=4096 count=1 2>/dev/null
+        truncate -s "$size" "/jfs/stream_sizes/$filename"
+    done
+
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9005/myjfs/stream_sizes/ \
+        minio://minioadmin:minioadmin@localhost:9000/myjfs/stream_sizes/ \
+        --threads 4 --debug 2>&1 | tee /tmp/sync_stream_sizes.log
+
+    # Verify all files synced correctly
+    for size in "${sizes[@]}"; do
+        local filename="file_${size}"
+        ./mc cp "myminio/myjfs/stream_sizes/$filename" "/tmp/$filename"
+        cmp "/jfs/stream_sizes/$filename" "/tmp/$filename" || \
+            (echo "FAIL: content mismatch for $filename (size=$size)" && exit 1)
+        rm -f "/tmp/$filename"
+    done
+
+    echo "PASS: multipart stream upload with various sizes"
+}
+
+test_sync_multipart_stream_concurrent(){
+    prepare_test
+    local num_files=3
+    local part=$((5 * 1024 * 1024))  # 5MiB default part size
+    local file_size=$((part * 2 + 1024))  # ~10MiB - triggers 3 parts
+
+    mkdir -p /jfs/stream_concurrent
+    for i in $(seq 1 $num_files); do
+        # Random header so cmp can detect corruption
+        dd if=/dev/urandom of="/jfs/stream_concurrent/file_$i" bs=4096 count=1 2>/dev/null
+        truncate -s "$file_size" "/jfs/stream_concurrent/file_$i"
+    done
+
+    # Sync with multiple threads to trigger concurrent multipart uploads
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9005/myjfs/stream_concurrent/ \
+        minio://minioadmin:minioadmin@localhost:9000/myjfs/stream_concurrent/ \
+        --threads 6 --debug 2>&1 | tee /tmp/sync_stream_concurrent.log
+
+    # Verify all files
+    for i in $(seq 1 $num_files); do
+        ./mc cp "myminio/myjfs/stream_concurrent/file_$i" "/tmp/file_$i"
+        cmp "/jfs/stream_concurrent/file_$i" "/tmp/file_$i" || \
+            (echo "FAIL: content mismatch for file_$i" && exit 1)
+        rm -f "/tmp/file_$i"
+    done
+
+    # Check for any errors in log
+    grep -i "panic:\|<FATAL>" /tmp/sync_stream_concurrent.log && \
+        (echo "FAIL: panic or fatal error in concurrent stream sync" && exit 1) || true
+
+    echo "PASS: concurrent multipart stream upload"
+}
+
+test_sync_multipart_stream_integrity(){
+    prepare_test
+    local part=$((5 * 1024 * 1024))  # 5MiB default part size
+    local file_size=$((part * 3))    # 15MiB - 3 parts
+    local filename="integrity_check.bin"
+
+    # Full random content so MD5 detects any corruption
+    dd if=/dev/urandom of="/jfs/$filename" bs=1M count=15 2>/dev/null
+    local src_md5
+    src_md5=$(md5sum "/jfs/$filename" | awk '{print $1}')
+    local src_size
+    src_size=$(stat -c%s "/jfs/$filename" 2>/dev/null || stat -f%z "/jfs/$filename")
+
+    # Sync using stream API
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9005/myjfs/$filename \
+        minio://minioadmin:minioadmin@localhost:9000/myjfs/$filename \
+        --threads 4 --debug 2>&1 | tee /tmp/sync_stream_integrity.log
+
+    # Download and verify
+    ./mc cp "myminio/myjfs/$filename" "/tmp/$filename"
+    local dst_md5
+    dst_md5=$(md5sum "/tmp/$filename" | awk '{print $1}')
+    local dst_size
+    dst_size=$(stat -c%s "/tmp/$filename" 2>/dev/null || stat -f%z "/tmp/$filename")
+
+    if [ "$src_md5" != "$dst_md5" ]; then
+        echo "FAIL: MD5 checksum mismatch"
+        echo "  src: $src_md5"
+        echo "  dst: $dst_md5"
+        exit 1
+    fi
+
+    if [ "$src_size" != "$dst_size" ]; then
+        echo "FAIL: file size mismatch"
+        echo "  src: $src_size"
+        echo "  dst: $dst_size"
+        exit 1
+    fi
+
+    rm -f "/tmp/$filename"
+    echo "PASS: multipart stream upload integrity check"
+}
+
+test_sync_multipart_stream_boundary(){
+    prepare_test
+    local part=$((5 * 1024 * 1024))  # 5MiB default part size
+
+    mkdir -p /jfs/stream_boundary
+    local sizes=(
+        $((part - 1))       # Just below 1 part
+        $part               # Exact 1 part
+        $((part + 1))       # Just above 1 part
+        $((part * 2 - 1))   # Just below 2 parts
+        $((part * 2))       # Exact 2 parts
+        $((part * 2 + 1))   # Just above 2 parts
+        $((part * 3 - 1))   # Just below 3 parts
+        $((part * 3))       # Exact 3 parts
+        $((part * 3 + 1))   # Just above 3 parts
+    )
+
+    for size in "${sizes[@]}"; do
+        local filename="boundary_${size}"
+        # Random 4KiB header + sparse tail for fast creation
+        dd if=/dev/urandom of="/jfs/stream_boundary/$filename" bs=4096 count=1 2>/dev/null
+        truncate -s "$size" "/jfs/stream_boundary/$filename"
+    done
+
+    ./juicefs sync minio://minioadmin:minioadmin@localhost:9005/myjfs/stream_boundary/ \
+        minio://minioadmin:minioadmin@localhost:9000/myjfs/stream_boundary/ \
+        --threads 2 --debug 2>&1 | tee /tmp/sync_stream_boundary.log
+
+    # Verify all files
+    for size in "${sizes[@]}"; do
+        local filename="boundary_${size}"
+        ./mc cp "myminio/myjfs/stream_boundary/$filename" "/tmp/$filename"
+        cmp "/jfs/stream_boundary/$filename" "/tmp/$filename" || \
+            (echo "FAIL: content mismatch for $filename (size=$size)" && exit 1)
+        rm -f "/tmp/$filename"
+    done
+
+    echo "PASS: multipart stream upload boundary test"
+}
+
+test_sync_multipart_stream_fallback(){
+    prepare_test
+    local part=$((5 * 1024 * 1024))  # 5MiB default part size
+    local file_size=$((part * 2 + 1024))  # ~10MiB - 3 parts
+
+    dd if=/dev/urandom of="/jfs/fallback_test.bin" bs=4096 count=1 2>/dev/null
+    truncate -s "$file_size" "/jfs/fallback_test.bin"
+
+    # Sync from JFS mount directly to minio (no gateway in between)
+    ./juicefs sync /jfs/fallback_test.bin minio://minioadmin:minioadmin@localhost:9000/myjfs/fallback_test.bin \
+        --threads 2 --debug 2>&1 | tee /tmp/sync_stream_fallback.log
+
+    # Download and verify
+    ./mc cp "myminio/myjfs/fallback_test.bin" "/tmp/fallback_test.bin"
+    cmp "/jfs/fallback_test.bin" "/tmp/fallback_test.bin" || \
+        (echo "FAIL: content mismatch for fallback test" && exit 1)
+
+    # Check log doesn't have fatal errors
+    grep -i "panic:\|<FATAL>" /tmp/sync_stream_fallback.log && \
+        (echo "FAIL: panic or fatal error in fallback sync" && exit 1) || true
+
+    rm -f "/tmp/fallback_test.bin"
+    echo "PASS: multipart stream fallback test"
 }
 
 source .github/scripts/common/run_test.sh && run_test $@

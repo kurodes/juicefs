@@ -56,7 +56,7 @@ func (t *tosClient) Limits() Limits {
 }
 
 func (t *tosClient) Create(ctx context.Context) error {
-	_, err := t.client.CreateBucketV2(ctx, &tos.CreateBucketV2Input{Bucket: t.bucket, StorageClass: enum.StorageClassType(t.sc)})
+	_, err := t.client.CreateBucketV2(ctx, &tos.CreateBucketV2Input{Bucket: t.bucket, StorageClass: enum.StorageClassType(t.tiers[0].Sc)})
 	if e, ok := err.(*tos.TosServerError); ok {
 		if e.Code == codes.BucketAlreadyOwnedByYou || e.Code == codes.BucketAlreadyExists {
 			return nil
@@ -98,19 +98,23 @@ func (t *tosClient) Put(ctx context.Context, key string, in io.Reader, getters .
 			checksumAlgr: generateChecksum(ins),
 		}
 	}
-	sc := t.GetStorageClass(ctx)
-	resp, err := t.client.PutObjectV2(ctx, &tos.PutObjectV2Input{
+	tier := t.GetTier(ctx)
+	input := &tos.PutObjectV2Input{
 		PutObjectBasicInput: tos.PutObjectBasicInput{
 			Bucket:       t.bucket,
 			Key:          key,
-			StorageClass: enum.StorageClassType(sc),
+			StorageClass: enum.StorageClassType(tier.Sc),
 			Meta:         meta,
 		},
 		Content: in,
-	})
+	}
+	if tier.encodedTag != "" {
+		input.Tagging = tier.encodedTag
+	}
+	resp, err := t.client.PutObjectV2(ctx, input)
 	if resp != nil {
 		attrs := ApplyGetters(getters...)
-		attrs.SetRequestID(resp.RequestID).SetStorageClass(sc)
+		attrs.SetRequestID(resp.RequestID).SetStorageClass(tier.Sc)
 	}
 	return err
 }
@@ -197,7 +201,7 @@ func (t *tosClient) CreateMultipartUpload(ctx context.Context, key string) (*Mul
 	resp, err := t.client.CreateMultipartUploadV2(ctx, &tos.CreateMultipartUploadV2Input{
 		Bucket:       t.bucket,
 		Key:          key,
-		StorageClass: enum.StorageClassType(t.sc),
+		StorageClass: enum.StorageClassType(t.tiers[0].Sc),
 	})
 	if err != nil {
 		return nil, err
@@ -277,29 +281,30 @@ func (t *tosClient) ListUploads(ctx context.Context, marker string) ([]*PendingP
 }
 
 func (t *tosClient) Copy(ctx context.Context, dst, src string) error {
-	sc := getOrDefaultScValue(t.GetStorageClass(ctx), string(enum.StorageClassStandard))
-	_, err := t.client.CopyObject(ctx, &tos.CopyObjectInput{
+	tier := t.GetTier(ctx)
+	sc := getOrDefaultScValue(tier.Sc, string(enum.StorageClassStandard))
+	input := &tos.CopyObjectInput{
 		SrcBucket:    t.bucket,
 		Bucket:       t.bucket,
 		SrcKey:       src,
 		Key:          dst,
 		StorageClass: enum.StorageClassType(sc),
-	})
+	}
+	if tier.encodedTag != "" {
+		input.Tagging = tier.encodedTag
+		input.TaggingDirective = enum.TaggingDirectiveReplace
+	}
+	_, err := t.client.CopyObject(ctx, input)
 	return err
 }
-func (t *tosClient) Restore(ctx context.Context, key string) error {
+func (t *tosClient) Restore(ctx context.Context, key string, days int32) error {
 	_, err := t.client.RestoreObject(ctx, &tos.RestoreObjectInput{
 		Bucket:               t.bucket,
 		Key:                  key,
-		Days:                 defaultRestoreDays,
+		Days:                 int(days),
 		RestoreJobParameters: &tos.RestoreJobParameters{Tier: enum.TierStandard},
 	})
 	return err
-}
-
-func (t *tosClient) SetStorageClass(sc string) error {
-	t.sc = sc
-	return nil
 }
 
 func newTOS(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {

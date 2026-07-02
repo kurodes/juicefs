@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
+	"strings"
 	"time"
 )
 
@@ -29,17 +31,18 @@ type withPrefix struct {
 	prefix string
 }
 
-func (s *withPrefix) SetTier(init Tiers) {
+func (s *withPrefix) InitTiers(init Tiers) error {
 	if o, ok := s.os.(SupportTier); ok {
-		o.SetTier(init)
+		return o.InitTiers(init)
 	}
+	return notSupported
 }
 
-func (s *withPrefix) GetStorageClass(ctx context.Context) string {
+func (s *withPrefix) GetTier(ctx context.Context) Tier {
 	if o, ok := s.os.(SupportTier); ok {
-		return o.GetStorageClass(ctx)
+		return o.GetTier(ctx)
 	}
-	return ""
+	return Tier{}
 }
 
 // WithPrefix return an object storage that add a prefix to keys.
@@ -47,11 +50,35 @@ func WithPrefix(os ObjectStorage, prefix string) ObjectStorage {
 	return &withPrefix{os, prefix}
 }
 
-func (s *withPrefix) SetStorageClass(sc string) error {
-	if o, ok := s.os.(SupportStorageClass); ok {
-		return o.SetStorageClass(sc)
+// DirStorage returns an ObjectStorage representing the parent directory of s.
+// If s already represents a directory (String() ends with "/"), it is returned unchanged.
+// For file-like storages, returns a new storage rooted at the parent directory.
+func DirStorage(s ObjectStorage) ObjectStorage {
+	switch t := s.(type) {
+	case *encrypted:
+		return &encrypted{ObjectStorage: DirStorage(t.ObjectStorage), enc: t.enc}
+	case *chunkedEncrypted:
+		return NewChunkedEncrypted(DirStorage(t.ObjectStorage), t.enc)
+	case *chunkedEncryptedFS:
+		return NewChunkedEncrypted(DirStorage(t.chunkedEncrypted.ObjectStorage), t.enc)
+	case *chunkedEncryptedFSSymlink:
+		return NewChunkedEncrypted(DirStorage(t.chunkedEncryptedFS.chunkedEncrypted.ObjectStorage), t.enc)
 	}
-	return notSupported
+	if strings.HasSuffix(s.String(), "/") {
+		return s
+	}
+	switch t := s.(type) {
+	case *withPrefix:
+		dir := path.Clean(path.Dir(t.prefix))
+		if dir == "." {
+			return t.os
+		}
+		return &withPrefix{os: t.os, prefix: dir + "/"}
+	case *filestore:
+		dir := path.Clean(path.Dir(t.root))
+		return &filestore{root: dir + "/"}
+	}
+	return s
 }
 
 func (s *withPrefix) Symlink(oldName, newName string) error {
@@ -59,6 +86,13 @@ func (s *withPrefix) Symlink(oldName, newName string) error {
 		return w.Symlink(oldName, s.prefix+newName)
 	}
 	return notSupported
+}
+
+func (s *withPrefix) UploadPartStream(key string, uploadID string, num int, in io.Reader) (*Part, error) {
+	if w, ok := s.os.(SupportUploadPartStream); ok {
+		return w.UploadPartStream(s.prefix+key, uploadID, num, in)
+	}
+	return nil, notSupported
 }
 
 func (s *withPrefix) Readlink(name string) (string, error) {
@@ -80,12 +114,23 @@ func (p *withPrefix) Create(ctx context.Context) error {
 	return p.os.Create(ctx)
 }
 
+type withSys interface {
+	Sys() any
+}
+
 type withFile struct {
 	File
 	key string
 }
 
 func (f *withFile) Key() string { return f.key }
+
+func (f *withFile) Sys() any {
+	if s, ok := f.File.(withSys); ok {
+		return s.Sys()
+	}
+	return nil
+}
 
 type withObj struct {
 	Object
@@ -221,11 +266,12 @@ func (p *withPrefix) ListUploads(ctx context.Context, marker string) ([]*Pending
 	return parts, nextMarker, err
 }
 
-func (p *withPrefix) Restore(ctx context.Context, key string) error {
-	return p.os.Restore(ctx, p.prefix+key)
+func (p *withPrefix) Restore(ctx context.Context, key string, days int32) error {
+	return p.os.Restore(ctx, p.prefix+key, days)
 }
 
 var _ ObjectStorage = (*withPrefix)(nil)
+var _ SupportTier = (*withPrefix)(nil)
 
 func IsFileSystem(object ObjectStorage) bool {
 	if o, ok := object.(*withPrefix); ok {

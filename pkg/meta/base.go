@@ -104,6 +104,8 @@ type engine interface {
 	doFindDetachedNodes(t time.Time) []Ino
 	doCleanupDetachedNode(ctx Context, detachedNode Ino) syscall.Errno
 
+	doScanSustainedInodes(ctx Context, fn func(uid, gid uint32, length uint64) error) error
+
 	doGetQuota(ctx Context, qtype uint32, key uint64) (*Quota, error)
 	// set quota, return true if there is no quota exists before
 	doSetQuota(ctx Context, qtype uint32, key uint64, quota *Quota) (created bool, err error)
@@ -302,12 +304,13 @@ type baseMeta struct {
 	fsStatsLock sync.Mutex
 	*fsStat
 
-	parentMu    sync.Mutex        // protect dirParents
-	quotaMu     sync.RWMutex      // protect dirQuotas
-	dirParents  map[Ino]Ino       // directory inode -> parent inode
-	dirQuotas   map[uint64]*Quota // directory inode -> quota
-	userQuotas  map[uint64]*Quota // uid -> quota
-	groupQuotas map[uint64]*Quota // gid -> quota
+	parentMu        sync.Mutex        // protect dirParents
+	quotaMu         sync.RWMutex      // protect dirQuotas
+	quotasFlushLock sync.Mutex        // prevent concurrent doFlushQuotas
+	dirParents      map[Ino]Ino       // directory inode -> parent inode
+	dirQuotas       map[uint64]*Quota // directory inode -> quota
+	userQuotas      map[uint64]*Quota // uid -> quota
+	groupQuotas     map[uint64]*Quota // gid -> quota
 
 	quotaMetricMu        sync.Mutex
 	dirQuotaMetricKeys   map[uint64]bool
@@ -722,9 +725,8 @@ func (m *baseMeta) Load(checkVersion bool) (*Format, error) {
 		}
 	}
 	if format.Tiers == nil {
-		format.Tiers = object.NewTiers()
+		format.Tiers = object.NewTiers(format.StorageClass)
 	}
-	format.Tiers[0] = object.Tier{}
 	m.Lock()
 	m.fmt = format
 	m.Unlock()
@@ -2892,7 +2894,8 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 	} else if st == 0 {
 		m.of.InvalidateChunk(inode, indx)
 	} else {
-		logger.Warnf("compact %d %d: %s", inode, indx, err)
+		logger.Warnf("compact %d %d: %s; slice %d (%d bytes) may be orphaned, will be cleaned by gc",
+			inode, indx, st, id, size)
 	}
 
 	if force {
@@ -3981,6 +3984,12 @@ func (m *baseMeta) DumpMetaV2(ctx Context, w io.Writer, opt *DumpOption) error {
 			break
 		}
 		seg := newBakSegment(res.msg)
+		if seg == nil {
+			if res.release != nil {
+				res.release(res.msg)
+			}
+			continue
+		}
 		if err := bak.writeSegment(w, seg); err != nil {
 			logger.Errorf("write %d err: %v", seg.typ, err)
 			ctx.Cancel()

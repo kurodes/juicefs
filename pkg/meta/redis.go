@@ -296,6 +296,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 }
 
 func (m *redisMeta) Shutdown() error {
+	m.of.close()
 	if m.cache != nil {
 		m.cache.close()
 		m.cache = nil
@@ -842,15 +843,25 @@ func (m *redisMeta) doSyncVolumeStat(ctx Context, used, inodes int64) error {
 	if m.conf.ReadOnly {
 		return syscall.EROFS
 	}
+	if err := m.doScanSustainedInodes(ctx, func(uid, gid uint32, length uint64) error {
+		used += align4K(length)
+		inodes++
+		return nil
+	}); err != nil {
+		return err
+	}
+	logger.Debugf("Used space: %s, inodes: %d", humanize.IBytes(uint64(used)), inodes)
+	if err := m.rdb.Set(ctx, m.totalInodesKey(), strconv.FormatInt(inodes, 10), 0).Err(); err != nil {
+		return fmt.Errorf("set total inodes: %s", err)
+	}
+	return m.rdb.Set(ctx, m.usedSpaceKey(), strconv.FormatInt(used, 10), 0).Err()
+}
 
+func (m *redisMeta) doScanSustainedInodes(ctx Context, fn func(uid, gid uint32, length uint64) error) error {
 	var inoKeys []string
-	if err := m.scan(ctx, m.prefix+"session*", func(keys []string) error {
-		for i := 0; i < len(keys); i += 2 {
+	if err := m.scan(ctx, "session[0-9]*", func(keys []string) error {
+		for i := 0; i < len(keys); i += 1 {
 			key := keys[i]
-			if key == "sessions" {
-				continue
-			}
-
 			inodes, err := m.rdb.SMembers(ctx, key).Result()
 			if err != nil {
 				logger.Warnf("SMembers %s: %s", key, err)
@@ -884,16 +895,13 @@ func (m *redisMeta) doSyncVolumeStat(ctx Context, used, inodes int64) error {
 		for _, v := range values {
 			if v != nil {
 				m.parseAttr([]byte(v.(string)), &attr)
-				used += align4K(attr.Length)
-				inodes += 1
+				if err := fn(attr.Uid, attr.Gid, attr.Length); err != nil {
+					return err
+				}
 			}
 		}
 	}
-	logger.Debugf("Used space: %s, inodes: %d", humanize.IBytes(uint64(used)), inodes)
-	if err := m.rdb.Set(ctx, m.totalInodesKey(), strconv.FormatInt(inodes, 10), 0).Err(); err != nil {
-		return fmt.Errorf("set total inodes: %s", err)
-	}
-	return m.rdb.Set(ctx, m.usedSpaceKey(), strconv.FormatInt(used, 10), 0).Err()
+	return nil
 }
 
 // redisMeta updates the usage in each transaction
@@ -4475,23 +4483,31 @@ func (m *redisMeta) doDelQuota(ctx Context, qtype uint32, key uint64) error {
 }
 
 func (m *redisMeta) doLoadQuotas(ctx Context) (map[uint64]*Quota, map[uint64]*Quota, map[uint64]*Quota, error) {
+	format := m.getFormat()
+	dirQuotas := make(map[uint64]*Quota)
+	userQuotas := make(map[uint64]*Quota)
+	groupQuotas := make(map[uint64]*Quota)
+
 	quotaTypes := []struct {
-		qtype uint32
-		name  string
+		enabled bool
+		qtype   uint32
+		name    string
+		quotas  map[uint64]*Quota
 	}{
-		{DirQuotaType, "dir"},
-		{UserQuotaType, "user"},
-		{GroupQuotaType, "group"},
+		{format.DirStats, DirQuotaType, "dir", dirQuotas},
+		{format.UserGroupQuota, UserQuotaType, "user", userQuotas},
+		{format.UserGroupQuota, GroupQuotaType, "group", groupQuotas},
 	}
 
-	quotaMaps := make([]map[uint64]*Quota, 3)
-	for i, qt := range quotaTypes {
+	for _, qt := range quotaTypes {
+		if !qt.enabled {
+			continue
+		}
+
 		config, err := m.getQuotaKeys(qt.qtype)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("failed to load %s quotas: %w", qt.name, err)
 		}
-
-		quotas := make(map[uint64]*Quota)
 		if err := m.hscan(ctx, config.usedInodesKey, func(keys []string) error {
 			for i := 0; i < len(keys); i += 2 {
 				key := keys[i]
@@ -4522,7 +4538,7 @@ func (m *redisMeta) doLoadQuotas(ctx Context) (map[uint64]*Quota, map[uint64]*Qu
 					return err
 				}
 
-				quotas[id] = &Quota{
+				qt.quotas[id] = &Quota{
 					MaxSpace:   maxSpace,
 					MaxInodes:  maxInodes,
 					UsedSpace:  usedSpace,
@@ -4533,10 +4549,9 @@ func (m *redisMeta) doLoadQuotas(ctx Context) (map[uint64]*Quota, map[uint64]*Qu
 		}); err != nil {
 			return nil, nil, nil, err
 		}
-		quotaMaps[i] = quotas
 	}
 
-	return quotaMaps[0], quotaMaps[1], quotaMaps[2], nil
+	return dirQuotas, userQuotas, groupQuotas, nil
 }
 
 func (m *redisMeta) doFlushQuotas(ctx Context, quotas []*iQuota) error {

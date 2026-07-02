@@ -94,7 +94,7 @@ func (b *wasb) Get(ctx context.Context, key string, off, limit int64, getters ..
 	}
 	attrs := ApplyGetters(getters...)
 	// TODO fire another property request to get the actual storage class
-	attrs.SetRequestID(aws.ToString(download.RequestID)).SetStorageClass(b.sc)
+	attrs.SetRequestID(aws.ToString(download.RequestID)).SetStorageClass(b.tiers[0].Sc)
 	return download.Body, err
 }
 
@@ -108,14 +108,18 @@ func str2Tier(tier string) *blob2.AccessTier {
 }
 
 func (b *wasb) Put(ctx context.Context, key string, data io.Reader, getters ...AttrGetter) error {
-	sc := b.GetStorageClass(ctx)
+	t := b.GetTier(ctx)
 	options := azblob.UploadStreamOptions{}
-	if sc != "" {
-		options.AccessTier = str2Tier(sc)
+	if t.Sc != "" {
+		options.AccessTier = str2Tier(t.Sc)
+	}
+	if t.Tag != "" && ValidateTag(t.Tag) {
+		parts := strings.SplitN(t.Tag, "=", 2)
+		options.Tags = map[string]string{parts[0]: parts[1]}
 	}
 	resp, err := b.azblobCli.UploadStream(ctx, b.cName, key, data, &options)
 	attrs := ApplyGetters(getters...)
-	attrs.SetRequestID(aws.ToString(resp.RequestID)).SetStorageClass(sc)
+	attrs.SetRequestID(aws.ToString(resp.RequestID)).SetStorageClass(t.Sc)
 	return err
 }
 
@@ -133,6 +137,14 @@ func (b *wasb) Copy(ctx context.Context, dst, src string) error {
 			if _, err := blobClient.SetTier(ctx, *tier, &blob2.SetTierOptions{}); err != nil {
 				return err
 			}
+			if t.Tag != "" && ValidateTag(t.Tag) {
+				parts := strings.SplitN(t.Tag, "=", 2)
+				if len(parts) == 2 {
+					if _, err := blobClient.SetTags(ctx, map[string]string{parts[0]: parts[1]}, nil); err != nil {
+						return err
+					}
+				}
+			}
 		} else {
 			return fmt.Errorf("invalid tier id: %d", id)
 		}
@@ -141,8 +153,8 @@ func (b *wasb) Copy(ctx context.Context, dst, src string) error {
 	dstCli := b.container.NewBlobClient(dst)
 	srcCli := b.container.NewBlobClient(src)
 	options := &blob2.CopyFromURLOptions{}
-	if b.sc != "" {
-		options.Tier = str2Tier(b.sc)
+	if b.tiers[0].Sc != "" {
+		options.Tier = str2Tier(b.tiers[0].Sc)
 	}
 
 	var srcURL string
@@ -216,13 +228,8 @@ func (b *wasb) List(ctx context.Context, prefix, startAfter, token, delimiter st
 	return objs, pager.More(), nextMarker, nil
 }
 
-func (b *wasb) SetStorageClass(sc string) error {
-	b.sc = sc
-	return nil
-}
-
 // Restore Azure does not support restoring to a temporary read-only state; it can only directly permanently change the tier.
-func (b *wasb) Restore(ctx context.Context, key string) error {
+func (b *wasb) Restore(ctx context.Context, key string, days int32) error {
 	return notSupported
 }
 

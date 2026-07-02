@@ -40,7 +40,8 @@ func (s *wasabi) String() string {
 	return fmt.Sprintf("wasabi://%s/", s.s3client.bucket)
 }
 
-func (s *wasabi) SetStorageClass(_ string) error {
+func (s *wasabi) InitTiers(init Tiers) error {
+	s.tiers = NewTiers("")
 	return notSupported
 }
 
@@ -58,8 +59,8 @@ func newWasabi(endpoint, accessKey, secretKey, token string) (ObjectStorage, err
 	region := hostParts[2]
 	endpoint = uri.Scheme + "://" + uri.Host[len(bucket)+1:]
 
-	awsCfg, err := config.LoadDefaultConfig(ctx,
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, token)))
+	awsCfg, err := config.LoadDefaultConfig(ctx, append(defaultChecksumOpts(),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, token)))...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load config: %s", err)
 	}

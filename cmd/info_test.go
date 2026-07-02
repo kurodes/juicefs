@@ -27,12 +27,11 @@ import (
 )
 
 func TestInfo(t *testing.T) {
-	tmpFile, err := os.CreateTemp("/tmp", "")
+	tmpFile, err := os.CreateTemp(t.TempDir(), "")
 	if err != nil {
 		t.Fatalf("create temporary file: %s", err)
 	}
 	defer tmpFile.Close()
-	defer os.Remove(tmpFile.Name())
 	mountTemp(t, nil, nil, nil)
 	defer umountTemp(t)
 	// mock os.Stdout
@@ -58,7 +57,7 @@ func TestInfo(t *testing.T) {
 	}
 	replacer := strings.NewReplacer("\n", "", " ", "")
 	res := replacer.Replace(string(content))
-	answer := fmt.Sprintf("%s/dir1: inode: 2 files: 10 dirs: 1 length: 40 Bytes size: 44.00 KiB (45056 Bytes) path: /dir1 tier:0->default", testMountPoint)
+	answer := fmt.Sprintf("%s/dir1: inode: 2 files: 10 dirs: 1 length: 40 Bytes size: 44.00 KiB (45056 Bytes) path: /dir1 tier:0->", testMountPoint)
 	answer = replacer.Replace(answer)
 	require.Equal(t, answer, res)
 }

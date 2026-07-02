@@ -46,7 +46,7 @@ func TestTiKVClient(t *testing.T) { //skip mutate
 }
 
 func TestBadgerClient(t *testing.T) {
-	m, err := newKVMeta("badger", "badger", testConfig())
+	m, err := newKVMeta("badger", t.TempDir(), testConfig())
 	if err != nil || m.Name() != "badger" {
 		t.Fatalf("create meta: %s", err)
 	}
@@ -317,6 +317,55 @@ func TestBadgerScanKeysOnlyNilValues(t *testing.T) {
 	}
 	if scanned != 2 {
 		t.Fatalf("expected 2 keys scanned, got %d", scanned)
+	}
+}
+
+func TestBadgerSimpleTxnReadOnly(t *testing.T) {
+	c, err := newBadgerClient(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.close()
+
+	if err := c.txn(Background(), func(kt *kvTxn) error {
+		kt.set([]byte("ro_key"), []byte("ro_value"))
+		return nil
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	var got []byte
+	var scanned int
+	if err := c.simpleTxn(Background(), func(kt *kvTxn) error {
+		got = kt.get([]byte("ro_key"))
+		kt.scan([]byte("ro_"), nextKey([]byte("ro_")), false, func(k, v []byte) bool {
+			scanned++
+			return true
+		})
+		return nil
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "ro_value" || scanned != 1 {
+		t.Fatalf("simpleTxn read: got %q, scanned %d", got, scanned)
+	}
+
+	err = c.simpleTxn(Background(), func(kt *kvTxn) error {
+		kt.set([]byte("ro_key2"), []byte("v"))
+		return nil
+	}, 0)
+	if err != badger.ErrReadOnlyTxn {
+		t.Fatalf("expected ErrReadOnlyTxn, got %v", err)
+	}
+	var leaked []byte
+	if err := c.simpleTxn(Background(), func(kt *kvTxn) error {
+		leaked = kt.get([]byte("ro_key2"))
+		return nil
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if leaked != nil {
+		t.Fatalf("write in read-only txn must not be committed, got %q", leaked)
 	}
 }
 

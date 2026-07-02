@@ -87,7 +87,7 @@ func (g *gs) Create(ctx context.Context) error {
 
 	err := g.getClient().Bucket(g.bucket).Create(ctx, projectID, &storage.BucketAttrs{
 		Name:         g.bucket,
-		StorageClass: g.sc,
+		StorageClass: g.tiers[0].Sc,
 		Location:     g.region,
 	})
 	if err != nil && strings.Contains(err.Error(), "You already own this bucket") {
@@ -122,20 +122,19 @@ func (g *gs) Get(ctx context.Context, key string, off, limit int64, getters ...A
 	}
 	// TODO fire another attr request to get the actual storage class
 	attrs := ApplyGetters(getters...)
-	attrs.SetStorageClass(g.sc)
+	attrs.SetStorageClass(g.tiers[0].Sc)
 	return reader, nil
 }
 
 func (g *gs) Put(ctx context.Context, key string, data io.Reader, getters ...AttrGetter) error {
-	sc := g.GetStorageClass(ctx)
+	t := g.GetTier(ctx)
 	writer := g.getClient().Bucket(g.bucket).Object(key).NewWriter(ctx)
-	writer.StorageClass = sc
-
+	writer.StorageClass = t.Sc
 	// If you upload small objects (< 16MiB), you should set ChunkSize
 	// to a value slightly larger than the objects' sizes to avoid memory bloat.
 	// This is especially important if you are uploading many small objects concurrently.
 	writer.ChunkSize = 5 << 20
-
+	// todo: The lifecycle rules of GCS do not support filtering using tags
 	buf := bufPool.Get().(*[]byte)
 	defer bufPool.Put(buf)
 	_, err := io.CopyBuffer(writer, data, *buf)
@@ -143,12 +142,13 @@ func (g *gs) Put(ctx context.Context, key string, data io.Reader, getters ...Att
 		return err
 	}
 	attrs := ApplyGetters(getters...)
-	attrs.SetStorageClass(sc)
+	attrs.SetStorageClass(t.Sc)
 	return writer.Close()
 }
 
 func (g *gs) Copy(ctx context.Context, dst, src string) error {
-	sc := getOrDefaultScValue(g.GetStorageClass(ctx), DefaultStorageClass)
+	t := g.GetTier(ctx)
+	sc := getOrDefaultScValue(t.Sc, DefaultStorageClass)
 	client := g.getClient()
 	srcObj := client.Bucket(g.bucket).Object(src)
 	dstObj := client.Bucket(g.bucket).Object(dst)
@@ -189,13 +189,8 @@ func (g *gs) List(ctx context.Context, prefix, start, token, delimiter string, l
 	return objs, nextPageToken != "", nextPageToken, nil
 }
 
-func (g *gs) SetStorageClass(sc string) error {
-	g.sc = sc
-	return nil
-}
-
 // Restore GCS does not support restoring objects to a temporary readable state.
-func (g *gs) Restore(ctx context.Context, key string) error {
+func (g *gs) Restore(ctx context.Context, key string, days int32) error {
 	return notSupported
 }
 func newGS(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {

@@ -156,7 +156,7 @@ func selectionFlags() []cli.Flag {
 		&cli.BoolFlag{
 			Name:    "update",
 			Aliases: []string{"u"},
-			Usage:   "skip files if the destination is newer",
+			Usage:   "update existing files only when the source mtime is newer; ignore size differences",
 		},
 		&cli.BoolFlag{
 			Name:    "force-update",
@@ -398,7 +398,7 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 	uri, token := extractToken(uri)
 	u, err := url.Parse(uri)
 	if err != nil {
-		logger.Fatalf("Can't parse %q: %s", uri, err.Error())
+		logger.Fatalf("Can't parse %q: %s", utils.RemovePassword(uri), utils.RemovePassword(err.Error()))
 	}
 	user := u.User
 	var accessKey, secretKey string
@@ -452,7 +452,7 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 
 	if conf.Links {
 		if _, ok := store.(object.SupportSymlink); !ok {
-			logger.Warnf("storage %q does not support symlink, ignore it", uri)
+			logger.Warnf("storage %q does not support symlink, ignore it", utils.RemovePassword(uri))
 			conf.Links = false
 		}
 	}
@@ -481,7 +481,11 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 			store = object.WithPrefix(store, u.Path[1:])
 		}
 	}
-
+	if os, ok := store.(object.SupportTier); ok {
+		if err := os.InitTiers(object.NewTiers("")); err != nil {
+			logger.Warnf("Set storage tier: %s", err)
+		}
+	}
 	return store, nil
 }
 
@@ -550,10 +554,10 @@ func doSync(c *cli.Context) error {
 		object.Shutdown(dst)
 	}()
 	if config.StorageClass != "" {
-		if os, ok := dst.(object.SupportStorageClass); ok {
-			err := os.SetStorageClass(config.StorageClass)
-			if err != nil {
-				logger.Errorf("set storage class %q: %s", config.StorageClass, err)
+		if os, ok := dst.(object.SupportTier); ok {
+			tiers := object.NewTiers(config.StorageClass)
+			if err := os.InitTiers(tiers); err != nil {
+				logger.Warnf("Set storage tier: %s", err)
 			}
 		}
 	}

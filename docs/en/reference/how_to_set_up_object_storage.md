@@ -269,6 +269,19 @@ juicefs format \
 The format of the option `--bucket` for all S3 compatible object storage services is `https://<bucket>.<endpoint>` or `https://<endpoint>/<bucket>`. The default `region` is `us-east-1`. When a different `region` is required, it can be set manually via the environment variable `AWS_REGION` or `AWS_DEFAULT_REGION`.
 :::
 
+:::tip
+For AWS SDK request and response checksums, JuiceFS sets `AWS_REQUEST_CHECKSUM_CALCULATION` and `AWS_RESPONSE_CHECKSUM_VALIDATION` to `when_required` by default. As a result, SDK-level checksum headers are only sent or validated when required by S3. This improves compatibility with S3-compatible services.
+
+If you are using Amazon S3 and want the SDK to calculate and validate checksums whenever checksum support is available for an operation, set the following environment variables before running JuiceFS:
+
+```shell
+export AWS_REQUEST_CHECKSUM_CALCULATION=when_supported
+export AWS_RESPONSE_CHECKSUM_VALIDATION=when_supported
+```
+
+These settings only affect AWS SDK-level checksums. The `disable-checksum=true` query parameter in `--bucket` controls the CRC checksum that JuiceFS stores in object metadata.
+:::
+
 ### Google Cloud Storage {#google-cloud}
 
 Google Cloud uses [IAM](https://cloud.google.com/iam/docs/overview) to manage permissions for accessing resources. Through authorizing [service accounts](https://cloud.google.com/iam/docs/creating-managing-service-accounts#iam-service-accounts-create-gcloud), you can have a fine-grained control of the access rights of cloud servers and object storage.
@@ -842,6 +855,10 @@ In order to reach Ceph Monitor, `librados` reads Ceph configuration file by sear
 - `ceph.conf` in the current working directory
 
 Since these additional Ceph configuration files are needed during the mount, CSI Driver users need to [upload them to Kubernetes, and map to the mount pod](https://juicefs.com/docs/csi/guide/pv/#mount-pod-extra-files).
+
+:::caution
+For workloads that only need to scan object keys, setting `JFS_OBJECT_NO_ORDER=1` or `JFS_OBJECT_NO_ORDER=true` skips sorting and per-object stat calls during Ceph RADOS listing. This improves listing speed for large pools, but the returned objects are unordered and do not include reliable size or modification time. Do not enable it for commands that rely on ordered listing or object metadata, such as `sync`.
+:::
 
 To format a volume, run:
 

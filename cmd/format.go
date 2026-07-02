@@ -142,6 +142,10 @@ func formatStorageFlags() []cli.Flag {
 			Name:  "storage-class",
 			Usage: "the default storage class",
 		},
+		&cli.StringFlag{
+			Name:  "tag",
+			Usage: "custom tag when uploading object storage (e.g. --tag key=value)",
+		},
 	})
 }
 
@@ -230,7 +234,6 @@ func fixObjectSize(s uint64) uint64 {
 }
 
 func createStorage(format meta.Format) (object.ObjectStorage, error) {
-
 	if err := format.Decrypt(); err != nil {
 		return nil, fmt.Errorf("format decrypt: %s", err)
 	}
@@ -282,18 +285,10 @@ func createStorage(format meta.Format) (object.ObjectStorage, error) {
 		return nil, err
 	}
 	blob = object.WithPrefix(blob, format.Name+"/")
-	if format.StorageClass != "" {
-		if os, ok := blob.(object.SupportStorageClass); ok {
-			err := os.SetStorageClass(format.StorageClass)
-			if err != nil {
-				logger.Warnf("set storage class %q: %v", format.StorageClass, err)
-			}
-		} else {
-			logger.Warnf("Storage class is not supported by %q, will ignore", format.Storage)
-		}
-	}
 	if os, ok := blob.(object.SupportTier); ok {
-		os.SetTier(format.Tiers)
+		if err := os.InitTiers(format.Tiers); err != nil {
+			logger.Warnf("Set storage tier: %s", err)
+		}
 	}
 	if format.EncryptKey != "" {
 		privKey, err := object.ParsePrivateKeyFromPem([]byte(format.EncryptKey), []byte(os.Getenv("JFS_RSA_PASSPHRASE")))
@@ -484,6 +479,7 @@ func format(c *cli.Context) error {
 			UUID:             uuid.New().String(),
 			Storage:          c.String("storage"),
 			StorageClass:     c.String("storage-class"),
+			Tiers:            object.NewTiers(""),
 			Bucket:           c.String("bucket"),
 			AccessKey:        c.String("access-key"),
 			SecretKey:        c.String("secret-key"),
@@ -506,6 +502,13 @@ func format(c *cli.Context) error {
 			RangerService:    c.String("ranger-service"),
 			KerbConf:         readKerbConf(c.String("kerberos-config-file")),
 		}
+		if sc := c.String("storage-class"); sc != "" {
+			format.Tiers[0] = object.Tier{
+				ID: 0,
+				Sc: sc,
+			}
+		}
+
 		if format.EnableACL {
 			format.MinClientVersion = "1.2.0-A"
 		}

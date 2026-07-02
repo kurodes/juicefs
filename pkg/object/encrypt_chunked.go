@@ -73,6 +73,9 @@ func (e *chunkedEncrypted) calcPlainSize(encSize int64) int64 {
 	if encSize <= 0 {
 		return 0
 	}
+	if encSize <= chunkHeaderSize+int64(e.overhead) {
+		return encSize
+	}
 	fullChunks := encSize / e.encChunkSize
 	remainder := encSize % e.encChunkSize
 	plainSize := fullChunks * plainChunkSize
@@ -336,17 +339,20 @@ func (e *chunkedEncrypted) UploadPartCopy(ctx context.Context, key string, uploa
 	return nil, notSupported
 }
 
-func (e *chunkedEncrypted) SetTier(init Tiers) {
+func (e *chunkedEncrypted) InitTiers(init Tiers) error {
 	if o, ok := e.ObjectStorage.(SupportTier); ok {
-		o.SetTier(init)
+		if err := o.InitTiers(init); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func (e *chunkedEncrypted) GetStorageClass(ctx context.Context) string {
+func (e *chunkedEncrypted) GetTier(ctx context.Context) Tier {
 	if o, ok := e.ObjectStorage.(SupportTier); ok {
-		return o.GetStorageClass(ctx)
+		return o.GetTier(ctx)
 	}
-	return ""
+	return Tier{}
 }
 
 var _ ObjectStorage = (*chunkedEncrypted)(nil)
@@ -364,3 +370,5 @@ type chunkedEncryptedFSSymlink struct {
 }
 
 var _ SupportSymlink = (*chunkedEncryptedFSSymlink)(nil)
+
+var _ SupportTier = (*chunkedEncryptedFSSymlink)(nil)

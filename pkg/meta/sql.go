@@ -54,7 +54,7 @@ const MaxFieldsCountOfTable = 19 // node table
 
 type setting struct {
 	Name  string `xorm:"pk"`
-	Value string `xorm:"varchar(4096) notnull"`
+	Value string `xorm:"text notnull"`
 }
 
 type counter struct {
@@ -339,8 +339,8 @@ func (m *dbMeta) sqlConv(sql string) string {
 }
 
 func (m *dbMeta) initStatement() {
-	m.statement["SELECT length FROM node WHERE inode IN (SELECT inode FROM sustained)"] =
-		fmt.Sprintf("SELECT length FROM %snode WHERE inode IN (SELECT inode FROM %ssustained)", m.tablePrefix, m.tablePrefix)
+	m.statement["SELECT n.uid, n.gid, n.length FROM node n WHERE n.inode IN (SELECT inode FROM sustained)"] =
+		fmt.Sprintf("SELECT n.uid, n.gid, n.length FROM %snode n WHERE n.inode IN (SELECT inode FROM %ssustained)", m.tablePrefix, m.tablePrefix)
 	m.statement["update counter set value=value + ? where name='totalInodes'"] =
 		fmt.Sprintf("update %scounter set value=value + ? where name='totalInodes'", m.tablePrefix)
 	m.statement["update counter set value= value + ? where name='usedSpace'"] =
@@ -545,6 +545,7 @@ func newSQLMeta(driver, addr string, conf *Config) (Meta, error) {
 }
 
 func (m *dbMeta) Shutdown() error {
+	m.of.close()
 	return m.db.Close()
 }
 
@@ -1213,13 +1214,13 @@ func (m *dbMeta) shouldRetry(err error) bool {
 		// error 1020 for MariaDB when conflict
 		return strings.Contains(msg, "try restarting transaction") || strings.Contains(msg, "try again later") ||
 			strings.Contains(msg, "duplicate entry") || strings.Contains(msg, "error 1020 (hy000)") ||
-			strings.Contains(msg, "invalid connection") || strings.Contains(msg, "bad connection") || errors.Is(err, io.EOF) // could not send data to client: No buffer space available
+			strings.Contains(msg, "invalid connection") || strings.Contains(msg, "bad connection") || errors.Is(err, io.EOF) || strings.Contains(msg, "serialize access") // could not send data to client: No buffer space available
 	case "postgres":
 		if e, ok := err.(interface{ SafeToRetry() bool }); ok {
 			return e.SafeToRetry()
 		}
 		return strings.Contains(msg, "current transaction is aborted") || strings.Contains(msg, "deadlock detected") ||
-			strings.Contains(msg, "duplicate key value") || strings.Contains(msg, "could not serialize access") ||
+			strings.Contains(msg, "duplicate key value") || strings.Contains(msg, "serialize access") ||
 			strings.Contains(msg, "bad connection") || errors.Is(err, io.EOF) // could not send data to client: No buffer space available
 	default:
 		return false
@@ -1417,20 +1418,9 @@ func (m *dbMeta) doSyncVolumeStat(ctx Context, used, inodes int64) error {
 	if m.conf.ReadOnly {
 		return syscall.EROFS
 	}
-	if err := m.simpleTxn(ctx, func(s *xorm.Session) error {
-		queryResultMap, err := s.QueryString(m.sqlConv("SELECT length FROM node WHERE inode IN (SELECT inode FROM sustained)"))
-		if err != nil {
-			return err
-		}
-		for _, v := range queryResultMap {
-			value, err := strconv.ParseInt(v["length"], 10, 64)
-			if err != nil {
-				logger.Warnf("parse sustained length: %s err: %s", v["length"], err)
-				continue
-			}
-			used += align4K(uint64(value))
-			inodes += 1
-		}
+	if err := m.doScanSustainedInodes(ctx, func(uid, gid uint32, length uint64) error {
+		used += align4K(length)
+		inodes++
 		return nil
 	}); err != nil {
 		return err
@@ -3268,6 +3258,36 @@ func (m *dbMeta) doRefreshSession() error {
 	})
 }
 
+func (m *dbMeta) doScanSustainedInodes(ctx Context, fn func(uid, gid uint32, length uint64) error) error {
+	return m.simpleTxn(ctx, func(s *xorm.Session) error {
+		rows, err := s.QueryString(m.sqlConv("SELECT n.uid, n.gid, n.length FROM node n WHERE n.inode IN (SELECT inode FROM sustained)"))
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			uid, err := strconv.ParseUint(row["uid"], 10, 32)
+			if err != nil {
+				logger.Warnf("parse sustained uid: %v", err)
+				continue
+			}
+			gid, err := strconv.ParseUint(row["gid"], 10, 32)
+			if err != nil {
+				logger.Warnf("parse sustained gid: %v", err)
+				continue
+			}
+			length, err := strconv.ParseUint(row["length"], 10, 64)
+			if err != nil {
+				logger.Warnf("parse sustained length: %v", err)
+				continue
+			}
+			if err := fn(uint32(uid), uint32(gid), length); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (m *dbMeta) doDeleteSustainedInode(sid uint64, inode Ino) error {
 	var n = node{Inode: inode}
 	var newSpace int64
@@ -3760,10 +3780,13 @@ func (m *dbMeta) deleteChunk(inode Ino, indx uint32) error {
 
 func (m *dbMeta) doDeleteFileData(inode Ino, length uint64) {
 	var indexes []chunk
-	_ = m.simpleTxn(Background(), func(s *xorm.Session) error {
+	if err := m.simpleTxn(Background(), func(s *xorm.Session) error {
 		indexes = nil
 		return s.Cols("indx").Find(&indexes, &chunk{Inode: inode})
-	})
+	}); err != nil {
+		logger.Warnf("delete chunks of inode %d length %d: find chunks: %s", inode, length, err)
+		return
+	}
 	for _, c := range indexes {
 		err := m.deleteChunk(inode, c.Indx)
 		if err != nil {
@@ -4392,15 +4415,20 @@ func (m *dbMeta) doDelQuota(ctx Context, qtype uint32, key uint64) error {
 }
 
 func (m *dbMeta) doLoadQuotas(ctx Context) (map[uint64]*Quota, map[uint64]*Quota, map[uint64]*Quota, error) {
+	format := m.getFormat()
 	var dirQuotasList []dirQuota
 	var userGroupQuotasList []userGroupQuota
 
 	err := m.simpleTxn(ctx, func(s *xorm.Session) error {
-		if e := s.Find(&dirQuotasList); e != nil {
-			return e
+		if format.DirStats {
+			if e := s.Find(&dirQuotasList); e != nil {
+				return e
+			}
 		}
-		if e := s.Find(&userGroupQuotasList); e != nil {
-			return e
+		if format.UserGroupQuota {
+			if e := s.Find(&userGroupQuotasList); e != nil {
+				return e
+			}
 		}
 		return nil
 	})

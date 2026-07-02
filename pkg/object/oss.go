@@ -53,17 +53,17 @@ func (o *ossClient) Limits() Limits {
 	return Limits{
 		IsSupportMultipartUpload: true,
 		IsSupportUploadPartCopy:  true,
-		MinPartSize:              int(oss.MinPartSize),
+		MinPartSize:              oss.MinPartSize,
 		MaxPartSize:              oss.MaxPartSize,
-		MaxPartCount:             int(oss.MaxUploadParts),
+		MaxPartCount:             int64(oss.MaxUploadParts),
 	}
 }
 
 func (o *ossClient) Create(ctx context.Context) error {
 	var configuration *oss.CreateBucketConfiguration
-	if o.sc != "" {
+	if o.tiers[0].Sc != "" {
 		configuration = &oss.CreateBucketConfiguration{
-			StorageClass: oss.StorageClassType(o.sc),
+			StorageClass: oss.StorageClassType(o.tiers[0].Sc),
 		}
 	}
 	_, err := o.client.PutBucket(ctx, &oss.PutBucketRequest{
@@ -132,12 +132,15 @@ func (o *ossClient) Get(ctx context.Context, key string, off, limit int64, gette
 }
 
 func (o *ossClient) Put(ctx context.Context, key string, in io.Reader, getters ...AttrGetter) error {
-	sc := o.GetStorageClass(ctx)
+	t := o.GetTier(ctx)
 	req := &oss.PutObjectRequest{
 		Bucket:       &o.bucket,
 		Key:          &key,
-		StorageClass: oss.StorageClassType(sc),
+		StorageClass: oss.StorageClassType(t.Sc),
 		Body:         in,
+	}
+	if t.encodedTag != "" {
+		req.Tagging = oss.Ptr(t.encodedTag)
 	}
 	if ins, ok := in.(io.ReadSeeker); ok {
 		req.Metadata = make(map[string]string)
@@ -154,16 +157,16 @@ func (o *ossClient) Put(ctx context.Context, key string, in io.Reader, getters .
 		reqId = result.Headers.Get(oss.HeaderOssRequestID)
 	}
 	attrs := ApplyGetters(getters...)
-	attrs.SetRequestID(reqId).SetStorageClass(sc)
+	attrs.SetRequestID(reqId).SetStorageClass(t.Sc)
 	return err
 }
 
-func (o *ossClient) Restore(ctx context.Context, key string) error {
+func (o *ossClient) Restore(ctx context.Context, key string, days int32) error {
 	_, err := o.client.RestoreObject(ctx, &oss.RestoreObjectRequest{
 		Bucket: oss.Ptr(o.bucket),
 		Key:    oss.Ptr(key),
 		RestoreRequest: &oss.RestoreRequest{
-			Days: defaultRestoreDays,
+			Days: days,
 			Tier: oss.Ptr("Standard"),
 		},
 	})
@@ -171,13 +174,18 @@ func (o *ossClient) Restore(ctx context.Context, key string) error {
 }
 
 func (o *ossClient) Copy(ctx context.Context, dst, src string) error {
-	sc := getOrDefaultScValue(o.GetStorageClass(ctx), string(oss.StorageClassStandard))
+	t := o.GetTier(ctx)
+	sc := getOrDefaultScValue(t.Sc, string(oss.StorageClassStandard))
 	var req = &oss.CopyObjectRequest{
 		SourceBucket: &o.bucket,
 		Bucket:       &o.bucket,
 		SourceKey:    &src,
 		Key:          &dst,
 		StorageClass: oss.StorageClassType(sc),
+	}
+	if t.encodedTag != "" {
+		req.Tagging = oss.Ptr(t.encodedTag)
+		req.TaggingDirective = oss.Ptr("Replace")
 	}
 	_, err := o.client.CopyObject(ctx, req)
 	return err
@@ -206,14 +214,17 @@ func (o *ossClient) List(ctx context.Context, prefix, start, token, delimiter st
 	if limit > 1000 {
 		limit = 1000
 	}
-	result, err := o.client.ListObjectsV2(ctx, &oss.ListObjectsV2Request{
-		Bucket:            &o.bucket,
-		Prefix:            &prefix,
-		StartAfter:        &start,
-		ContinuationToken: &token,
-		Delimiter:         &delimiter,
-		MaxKeys:           int32(limit),
-	})
+	request := &oss.ListObjectsV2Request{
+		Bucket:     &o.bucket,
+		Prefix:     &prefix,
+		StartAfter: &start,
+		Delimiter:  &delimiter,
+		MaxKeys:    int32(limit),
+	}
+	if token != "" {
+		request.ContinuationToken = &token
+	}
+	result, err := o.client.ListObjectsV2(ctx, request)
 	if err != nil {
 		return nil, false, "", err
 	}
@@ -240,7 +251,7 @@ func (o *ossClient) CreateMultipartUpload(ctx context.Context, key string) (*Mul
 	result, err := o.client.InitiateMultipartUpload(ctx, &oss.InitiateMultipartUploadRequest{
 		Bucket:       &o.bucket,
 		Key:          &key,
-		StorageClass: oss.StorageClassType(o.sc),
+		StorageClass: oss.StorageClassType(o.tiers[0].Sc),
 	})
 	if err != nil {
 		return nil, err
@@ -316,11 +327,6 @@ func (o *ossClient) ListUploads(ctx context.Context, marker string) ([]*PendingP
 		parts[i] = &PendingPart{oss.ToString(result.Key), oss.ToString(result.UploadId), oss.ToTime(u.LastModified)}
 	}
 	return parts, string(result.NextPartNumberMarker), nil
-}
-
-func (o *ossClient) SetStorageClass(sc string) error {
-	o.sc = sc
-	return nil
 }
 
 func autoOSSEndpoint(bucketName string, provider credentials.CredentialsProvider) (string, error) {

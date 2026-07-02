@@ -128,6 +128,7 @@ func newKVMeta(driver, addr string, conf *Config) (Meta, error) {
 }
 
 func (m *kvMeta) Shutdown() error {
+	m.of.close()
 	return m.client.close()
 }
 
@@ -2048,7 +2049,7 @@ func (m *kvMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, oldA
 		if pinode != nil {
 			*pinode = inode
 		}
-		rs := tx.gets(m.inodeKey(parent), m.inodeKey(inode))
+		rs := tx.gets(m.inodeKey(parent), m.inodeKey(inode), m.dirQuotaKey(inode))
 		if rs[0] == nil {
 			return syscall.ENOENT
 		}
@@ -2108,7 +2109,9 @@ func (m *kvMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, oldA
 		}
 		tx.delete(m.entryKey(parent, name))
 		tx.delete(m.dirStatKey(inode))
-		tx.delete(m.dirQuotaKey(inode))
+		if rs[2] != nil { // avoid creating massive tombstones for quota keys we never set.
+			tx.delete(m.dirQuotaKey(inode))
+		}
 		if trash > 0 {
 			tx.set(m.inodeKey(inode), m.marshal(&attr))
 			tx.set(m.entryKey(trash, m.trashEntry(parent, inode, name)), buf)
@@ -2167,7 +2170,7 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 			}
 			return nil
 		}
-		rs := tx.gets(m.inodeKey(parentSrc), m.inodeKey(parentDst), m.inodeKey(ino))
+		rs := tx.gets(m.inodeKey(parentSrc), m.inodeKey(parentDst), m.inodeKey(ino), m.entryKey(parentDst, nameDst))
 		if rs[0] == nil || rs[1] == nil || rs[2] == nil {
 			return syscall.ENOENT
 		}
@@ -2202,7 +2205,7 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 			return syscall.EACCES
 		}
 
-		dbuf := tx.get(m.entryKey(parentDst, nameDst))
+		dbuf := rs[3]
 		if dbuf == nil && m.conf.CaseInsensi {
 			if e := m.resolveCase(ctx, parentDst, nameDst); e != nil {
 				if string(e.Name) != nameSrc || parentDst != parentSrc {
@@ -2377,7 +2380,9 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 					}
 				}
 				if dtyp == TypeDirectory {
-					tx.delete(m.dirQuotaKey(dino))
+					if quotaKey := m.dirQuotaKey(dino); tx.get(quotaKey) != nil { // avoid creating massive tombstones for quota keys we never set.
+						tx.delete(quotaKey)
+					}
 				}
 			}
 		}
@@ -2419,7 +2424,7 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 
 func (m *kvMeta) doLink(ctx Context, inode, parent Ino, name string, attr *Attr) syscall.Errno {
 	return errno(m.txn(ctx, func(tx *kvTxn) error {
-		rs := tx.gets(m.inodeKey(parent), m.inodeKey(inode))
+		rs := tx.gets(m.inodeKey(parent), m.inodeKey(inode), m.entryKey(parent, name))
 		if rs[0] == nil || rs[1] == nil {
 			return syscall.ENOENT
 		}
@@ -2444,7 +2449,7 @@ func (m *kvMeta) doLink(ctx Context, inode, parent Ino, name string, attr *Attr)
 		if (iattr.Flags&FlagAppend) != 0 || (iattr.Flags&FlagImmutable) != 0 {
 			return syscall.EPERM
 		}
-		buf := tx.get(m.entryKey(parent, name))
+		buf := rs[2]
 		if buf != nil || m.conf.CaseInsensi && m.resolveCase(ctx, parent, name) != nil {
 			return syscall.EEXIST
 		}
@@ -2564,6 +2569,31 @@ func (m *kvMeta) doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*Entry
 		}
 	}
 	return 0
+}
+
+func (m *kvMeta) doScanSustainedInodes(ctx Context, fn func(uid, gid uint32, length uint64) error) error {
+	vals, err := m.scanKeys(ctx, m.fmtKey("SS"))
+	if err != nil {
+		return err
+	}
+	var attr Attr
+	for _, k := range vals {
+		b := utils.FromBuffer(k[2:])
+		if b.Len() != 16 {
+			logger.Warnf("Invalid sustainedKey: %v", k)
+			continue
+		}
+		_ = b.Get64()
+		inode := m.decodeInode(b.Get(8))
+		if eno := m.doGetAttr(ctx, inode, &attr); eno != 0 {
+			logger.Warnf("Get attr of sustained inode %d: %s", inode, eno)
+			continue
+		}
+		if err := fn(attr.Uid, attr.Gid, attr.Length); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *kvMeta) doDeleteSustainedInode(sid uint64, inode Ino) error {
@@ -3525,40 +3555,37 @@ func (m *kvMeta) doDelQuota(ctx Context, qtype uint32, key uint64) error {
 }
 
 func (m *kvMeta) doLoadQuotas(ctx Context) (map[uint64]*Quota, map[uint64]*Quota, map[uint64]*Quota, error) {
+	format := m.getFormat()
+	dirQuotas := make(map[uint64]*Quota)
+	userQuotas := make(map[uint64]*Quota)
+	groupQuotas := make(map[uint64]*Quota)
+
 	quotaTypes := []struct {
-		prefix string
-		name   string
+		enabled bool
+		prefix  string
+		name    string
+		quotas  map[uint64]*Quota
+		decode  func(k string) uint64
 	}{
-		{"QD", "dir"},
-		{"QU", "user"},
-		{"QG", "group"},
+		{format.DirStats, "QD", "dir", dirQuotas, func(k string) uint64 { return uint64(m.decodeInode([]byte(k[2:]))) }}, // skip prefix
+		{format.UserGroupQuota, "QU", "user", userQuotas, func(k string) uint64 { return binary.BigEndian.Uint64([]byte(k[2:])) }},
+		{format.UserGroupQuota, "QG", "group", groupQuotas, func(k string) uint64 { return binary.BigEndian.Uint64([]byte(k[2:])) }},
 	}
 
-	quotaMaps := make([]map[uint64]*Quota, 3)
-	for i, qt := range quotaTypes {
+	for _, qt := range quotaTypes {
+		if !qt.enabled {
+			continue
+		}
 		pairs, err := m.scanValues(ctx, m.fmtKey(qt.prefix), -1, nil)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to load %s quotas: %w", qt.name, err)
+			return nil, nil, nil, fmt.Errorf("failed to load %q quotas: %w", qt.name, err)
 		}
-		var quotas map[uint64]*Quota
-		if len(pairs) == 0 {
-			quotas = make(map[uint64]*Quota)
-		} else {
-			quotas = make(map[uint64]*Quota, len(pairs))
-			for k, v := range pairs {
-				var id uint64
-				if qt.prefix == "QD" {
-					id = uint64(m.decodeInode([]byte(k[2:]))) // skip prefix
-				} else {
-					id = binary.BigEndian.Uint64([]byte(k[2:])) // skip prefix
-				}
-				quotas[id] = m.parseQuota(v)
-			}
+		for k, v := range pairs {
+			qt.quotas[qt.decode(k)] = m.parseQuota(v)
 		}
-		quotaMaps[i] = quotas
 	}
 
-	return quotaMaps[0], quotaMaps[1], quotaMaps[2], nil
+	return dirQuotas, userQuotas, groupQuotas, nil
 }
 
 func (m *kvMeta) cleanUgUsage(ctx Context, qtype uint32) error {
@@ -3595,29 +3622,15 @@ func (m *kvMeta) doSyncVolumeStat(ctx Context, used, inodes int64) error {
 	if m.conf.ReadOnly {
 		return syscall.EROFS
 	}
-	// need add sustained file size
-	vals, err := m.scanKeys(ctx, m.fmtKey("SS"))
-	if err != nil {
+	if err := m.doScanSustainedInodes(ctx, func(uid, gid uint32, length uint64) error {
+		used += align4K(length)
+		inodes++
+		return nil
+	}); err != nil {
 		return err
 	}
-	var attr Attr
-	for _, k := range vals {
-		b := utils.FromBuffer(k[2:])
-		if b.Len() != 16 {
-			logger.Warnf("Invalid sustainedKey: %v", k)
-			continue
-		}
-		_ = b.Get64()
-		inode := m.decodeInode(b.Get(8))
-		if eno := m.doGetAttr(ctx, inode, &attr); eno != 0 {
-			logger.Warnf("Get attr of inode %d: %s", inode, eno)
-			continue
-		}
-		used += align4K(attr.Length)
-		inodes += 1
-	}
 	logger.Debugf("Used space: %s, inodes: %d", humanize.IBytes(uint64(used)), inodes)
-	err = m.setValue(m.counterKey(totalInodes), packCounter(inodes))
+	err := m.setValue(m.counterKey(totalInodes), packCounter(inodes))
 	if err != nil {
 		return fmt.Errorf("set total inodes: %w", err)
 	}
